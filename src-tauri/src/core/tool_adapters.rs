@@ -409,8 +409,8 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
         ToolAdapter {
             key: "kimi".into(),
             display_name: "Kimi Code CLI".into(),
-            relative_skills_dir: ".config/agents/skills".into(),
-            relative_detect_dir: ".kimi".into(),
+            relative_skills_dir: ".kimi-code/skills".into(),
+            relative_detect_dir: ".kimi-code".into(),
             additional_scan_dirs: vec![],
             override_skills_dir: None,
             category: ToolCategory::Coding,
