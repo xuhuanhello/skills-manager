@@ -1,5 +1,6 @@
 const AGENT_ICON_FILES: Record<string, string> = {
   adal: "adal.png",
+  common_agent: "common_agent.png",
   amp: "amp.svg",
   antigravity: "antigravity.png",
   augment: "augment.svg",

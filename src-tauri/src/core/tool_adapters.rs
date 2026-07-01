@@ -778,6 +778,21 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             recursive_scan: false,
             project_relative_skills_dir: None,
         },
+        // Virtual shared-agents adapter: maps ~/.agents/skills to a first-class
+        // workspace entry alongside Claude Code, Cursor, etc. Treated as
+        // installed whenever ~/.agents/skills exists.
+        ToolAdapter {
+            key: "common_agent".into(),
+            display_name: "公共 Agent".into(),
+            relative_skills_dir: ".agents/skills".into(),
+            relative_detect_dir: ".agents/skills".into(),
+            additional_scan_dirs: vec![],
+            override_skills_dir: None,
+            category: ToolCategory::Coding,
+            is_custom: false,
+            recursive_scan: false,
+            project_relative_skills_dir: Some(".agents/skills".into()),
+        },
     ]
 }
 
