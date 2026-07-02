@@ -389,6 +389,34 @@
         "pending": "Pending",
         "imported": "Imported"
       }
+    },
+    "repoTab": "Repositories",
+    "repo": {
+      "empty": "No repositories added yet",
+      "emptyHint": "Add a Git repository to browse and install skills from it.",
+      "addRepo": "Add Repository",
+      "addRepoTitle": "Add Skill Repository",
+      "repoUrl": "Repository URL",
+      "repoUrlPlaceholder": "https://github.com/user/repo",
+      "repoName": "Display Name",
+      "repoNamePlaceholder": "My Skills Repo",
+      "add": "Add",
+      "adding": "Fetching...",
+      "cancel": "Cancel",
+      "switchRepo": "Switch Repository",
+      "removeRepo": "Remove",
+      "loading": "Loading skills from repository...",
+      "loadError": "Failed to load repository",
+      "retry": "Retry",
+      "searchPlaceholder": "Search skills...",
+      "install": "Install",
+      "installing": "Installing...",
+      "installed": "Installed",
+      "noSkills": "No skills found",
+      "noSkillsHint": "This repository does not contain any skills.",
+      "noMatch": "No matching skills",
+      "noMatchHint": "Try a different search term.",
+      "skillCount": "{{count}} skills"
     }
   },
   "settings": {

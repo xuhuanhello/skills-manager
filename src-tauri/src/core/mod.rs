@@ -1,4 +1,5 @@
 pub mod app_state;
+pub mod github_api;
 pub mod audit_log;
 pub mod central_repo;
 pub mod content_hash;

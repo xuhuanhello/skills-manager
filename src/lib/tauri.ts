@@ -294,6 +294,24 @@ export const confirmGitInstall = (repoUrl: string, tempDir: string, items: Skill
 export const cancelGitPreview = (tempDir: string) =>
   invoke<void>("cancel_git_preview", { tempDir });
 
+export interface RepoSkillEntry {
+  name: string;
+  path: string;
+  description: string | null;
+}
+
+export const listRepoSkills = (owner: string, repo: string, branch: string) =>
+  invoke<RepoSkillEntry[]>("list_repo_skills", { owner, repo, branch });
+
+export const installRepoSkill = (
+  owner: string,
+  repo: string,
+  branch: string,
+  skillPath: string,
+  skillName: string,
+) =>
+  invoke<void>("install_repo_skill", { owner, repo, branch, skillPath, skillName });
+
 export const installFromSkillssh = (source: string, skillId: string) =>
   invoke<void>("install_from_skillssh", { source, skillId });
 

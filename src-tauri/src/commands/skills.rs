@@ -11,6 +11,7 @@ use crate::core::{
     central_repo,
     error::AppError,
     git_fetcher,
+    github_api,
     install_cancel::InstallCancelRegistry,
     installer,
     repo_lock::RepoLock,
@@ -2284,6 +2285,84 @@ pub async fn batch_import_folder(
             skipped,
             errors,
         })
+    })
+    .await?
+}
+
+// ========== Repository browsing commands ==========
+
+#[tauri::command]
+pub async fn list_repo_skills(
+    owner: String,
+    repo: String,
+    branch: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<Vec<github_api::RepoSkillEntry>, AppError> {
+    let proxy_url = store.inner().proxy_url();
+    tauri::async_runtime::spawn_blocking(move || {
+        github_api::list_repo_skills(&owner, &repo, &branch, proxy_url.as_deref())
+            .map_err(AppError::io)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn install_repo_skill(
+    owner: String,
+    repo: String,
+    branch: String,
+    skill_path: String,
+    skill_name: String,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<(), AppError> {
+    let store = store.inner().clone();
+    let proxy_url = store.proxy_url();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = RepoLock::acquire_foreground("install repo skill").map_err(AppError::db)?;
+
+        let temp_dir = github_api::download_skill_dir(
+            &owner,
+            &repo,
+            &branch,
+            &skill_path,
+            proxy_url.as_deref(),
+        )
+        .map_err(AppError::io)?;
+
+        let custom_name = skill_name.trim();
+        let install_name = if custom_name.is_empty() {
+            None
+        } else {
+            Some(custom_name)
+        };
+
+        let result = installer::install_from_git_dir(&temp_dir, install_name)
+            .map_err(AppError::io);
+
+        // Always clean up, regardless of success
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let result = result?;
+
+        let source_ref = format!("https://github.com/{}/{}", owner, repo);
+        let metadata = InstallSourceMetadata {
+            source_type: "git".to_string(),
+            source_ref: Some(source_ref.clone()),
+            source_ref_resolved: Some(format!("{}.git", source_ref)),
+            source_subpath: if skill_path.is_empty() {
+                None
+            } else {
+                Some(skill_path)
+            },
+            source_branch: Some(branch),
+            source_revision: None,
+            remote_revision: None,
+            update_status: "up_to_date".to_string(),
+        };
+
+        store_installed_skill_unlocked(&store, &result, &metadata, None)?;
+
+        Ok(())
     })
     .await?
 }

@@ -341,6 +341,34 @@
         "pending": "待匯入",
         "imported": "已匯入"
       }
+    },
+    "repoTab": "技能倉庫",
+    "repo": {
+      "empty": "尚未新增任何倉庫",
+      "emptyHint": "新增一個 Git 倉庫，按需瀏覽並安裝其中的技能。",
+      "addRepo": "新增倉庫",
+      "addRepoTitle": "新增技能倉庫",
+      "repoUrl": "倉庫網址",
+      "repoUrlPlaceholder": "https://github.com/user/repo",
+      "repoName": "顯示名稱",
+      "repoNamePlaceholder": "我的技能倉庫",
+      "add": "新增",
+      "adding": "載入中...",
+      "cancel": "取消",
+      "switchRepo": "切換倉庫",
+      "removeRepo": "刪除",
+      "loading": "正在從倉庫載入技能...",
+      "loadError": "載入倉庫失敗",
+      "retry": "重試",
+      "searchPlaceholder": "搜尋技能...",
+      "install": "安裝",
+      "installing": "安裝中...",
+      "installed": "已安裝",
+      "noSkills": "找不到技能",
+      "noSkillsHint": "此倉庫中沒有包含任何技能。",
+      "noMatch": "沒有符合的技能",
+      "noMatchHint": "換個關鍵詞再試試。",
+      "skillCount": "共 {{count}} 個技能"
     }
   },
   "settings": {
