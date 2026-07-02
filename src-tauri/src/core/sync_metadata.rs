@@ -40,6 +40,14 @@ pub struct SkillMetaFile {
     pub path_key: String,
     pub enabled: bool,
     pub tags: Vec<String>,
+    /// Persisted skill name chosen at install time. Reindex restores this
+    /// instead of re-deriving from SKILL.md frontmatter, so the name survives
+    /// a restart even when the frontmatter `name` differs from the install
+    /// name (e.g. repo-tab installs use the GitHub directory name, not the
+    /// frontmatter value). Older metadata files without this field fall back
+    /// to the previous derivation logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub source: SourceMeta,
 }
 
@@ -167,9 +175,13 @@ pub(crate) fn reindex_from_metadata_unlocked(store: &SkillStore) -> Result<()> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown-skill".to_string());
-        let name = parsed
+        // Prefer the name persisted at install time (stored in metadata since
+        // schema v1). Fall back to frontmatter `name`, then the directory
+        // name, for older metadata files that lack the field.
+        let name = meta
             .name
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| parsed.name.filter(|s| !s.trim().is_empty()))
             .unwrap_or(inferred_name);
         let previous = existing_by_id.get(&meta.skill_id);
         let source_ref = if matches!(meta.source.source_type.as_str(), "import" | "local") {
@@ -399,6 +411,7 @@ fn write_skill_file(skill: &SkillRecord, tags: &[String]) -> Result<()> {
         path,
         enabled: skill.enabled,
         tags,
+        name: Some(skill.name.clone()),
         source: SourceMeta {
             source_type: skill.source_type.clone(),
             ref_: source_ref,
@@ -749,6 +762,55 @@ mod tests {
                 .remove("skill-1")
                 .unwrap(),
             vec!["tag-a".to_string(), "tag-b".to_string()]
+        );
+    }
+
+    /// Regression: a git-installed skill whose SKILL.md frontmatter `name`
+    /// differs from its directory name must keep the name chosen at install
+    /// time after a restart reindex. Previously reindex overwrote the name
+    /// with the frontmatter value, breaking the repo-tab "installed" check
+    /// (`s.name === skill.name` where skill.name is the GitHub dir name).
+    #[test]
+    fn reindex_preserves_install_time_name_when_frontmatter_differs() {
+        let source = test_repo();
+        // Directory name (what GitHub repo-tab uses as skill name).
+        let dir_name = "my-skill";
+        let skill_dir = central_repo::skills_dir().join(dir_name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        // Frontmatter name intentionally differs from the directory name.
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: My Awesome Skill\n---\n",
+        )
+        .unwrap();
+
+        // Simulate a repo-tab install: source_type=git, name=dir_name.
+        let installed = SkillRecord {
+            id: "skill-1".to_string(),
+            name: dir_name.to_string(),
+            source_type: "git".to_string(),
+            source_ref: Some("https://github.com/owner/repo".to_string()),
+            source_ref_resolved: Some("https://github.com/owner/repo.git".to_string()),
+            source_subpath: Some("skills/my-skill".to_string()),
+            source_branch: Some("main".to_string()),
+            ..sample_skill("skill-1", &skill_dir)
+        };
+        source.store.insert_skill(&installed).unwrap();
+        write_all_from_db_unlocked(&source.store).unwrap();
+
+        // Simulate a restart: reindex from metadata into a fresh store.
+        let restored_store =
+            SkillStore::new(&central_repo::base_dir().join("restored.db")).unwrap();
+        reindex_from_metadata_unlocked(&restored_store).unwrap();
+
+        let restored = restored_store
+            .get_skill_by_id("skill-1")
+            .unwrap()
+            .expect("skill should be restored from metadata");
+        // The name must still match the directory name used at install time.
+        assert_eq!(
+            restored.name, dir_name,
+            "reindex must not overwrite install-time name with frontmatter name"
         );
     }
 }

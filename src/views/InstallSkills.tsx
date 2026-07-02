@@ -22,13 +22,15 @@ import {
   MoreHorizontal,
   Pencil,
   Calendar,
+  Database,
+  ChevronDown,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import * as api from "../lib/tauri";
-import type { ScanResult, SkillsShSkill, BatchImportResult, GitPreviewResult } from "../lib/tauri";
+import type { ScanResult, SkillsShSkill, BatchImportResult, RepoSkillEntry, GitPreviewResult } from "../lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useSearchParams, useNavigate } from "react-router-dom";
@@ -36,18 +38,114 @@ import { listen } from "@tauri-apps/api/event";
 import { StatusBanner } from "../components/StatusBanner";
 import { getErrorMessage, getErrorKind } from "../lib/error";
 
+interface SavedRepo {
+  id: string;
+  name: string;
+  owner: string;
+  repo: string;
+  branch: string;
+  url: string;
+  addedAt: number;
+}
+
+const SAVED_REPOS_KEY = "skillsManagerSavedRepos";
+const CURRENT_REPO_LS_KEY = "skillsManagerCurrentRepoId";
+
+function parseOwnerRepo(url: string): { owner: string; repo: string } | null {
+  const cleaned = url
+    .replace(/^https?:\/\/github\.com\//, "")
+    .replace(/\.git$/, "")
+    .replace(/\/$/, "");
+  const parts = cleaned.split("/");
+  if (parts.length >= 2 && parts[0] && parts[1]) {
+    return { owner: parts[0], repo: parts[1] };
+  }
+  return null;
+}
+
+function loadSavedRepos(): SavedRepo[] {
+  try {
+    const raw: SavedRepo[] = JSON.parse(localStorage.getItem(SAVED_REPOS_KEY) || "[]");
+    // Migrate old format: repos without owner/repo/branch fields
+    let needsSave = false;
+    const migrated = raw.map((r) => {
+      if (r.owner && r.repo) return r;
+      needsSave = true;
+      const parsed = parseOwnerRepo(r.url || "");
+      return {
+        ...r,
+        owner: parsed?.owner ?? "",
+        repo: parsed?.repo ?? "",
+        branch: r.branch || "main",
+      };
+    });
+    // Persist migration to avoid re-parsing on every restart
+    if (needsSave) {
+      localStorage.setItem(SAVED_REPOS_KEY, JSON.stringify(migrated));
+    }
+    return migrated;
+  } catch {
+    return [];
+  }
+}
+
+function saveSavedRepos(repos: SavedRepo[]): void {
+  localStorage.setItem(SAVED_REPOS_KEY, JSON.stringify(repos));
+}
+
 const MARKET_PAGE_SIZE = 24;
 const MARKET_SEARCH_STEP = 60;
 const MARKET_SEARCH_DEBOUNCE_MS = 450;
 const MARKET_SEARCH_CACHE_TTL_MS = 120_000;
 const MARKET_SEARCH_CACHE_MAX_ENTRIES = 150;
 
+// --- Repo skills in-memory cache (module-level, survives view unmount) ---
+// Re-fetching the GitHub tree on every tab switch is slow and rate-limit-prone,
+// so cached results are reused until they expire or the user forces a refresh.
+// A module-level Map is the primary store; sessionStorage mirrors it so the
+// cache also survives a full page reload (and any edge case where the module
+// is re-evaluated).
+const REPO_SKILLS_CACHE_TTL_MS = 5 * 60 * 1000;
+const REPO_SKILLS_SS_KEY = "skillsManagerRepoSkillsCache";
+
+interface RepoSkillsCacheEntry {
+  skills: RepoSkillEntry[];
+  timestamp: number;
+}
+
+const repoSkillsCache = new Map<string, RepoSkillsCacheEntry>();
+
+// Hydrate the in-memory map from sessionStorage once on module load.
+try {
+  const raw = sessionStorage.getItem(REPO_SKILLS_SS_KEY);
+  if (raw) {
+    const parsed = JSON.parse(raw) as Record<string, RepoSkillsCacheEntry>;
+    for (const [k, v] of Object.entries(parsed)) repoSkillsCache.set(k, v);
+  }
+} catch {
+  // ignore corrupt cache
+}
+
+function persistRepoSkillsCache() {
+  try {
+    const obj: Record<string, RepoSkillsCacheEntry> = {};
+    for (const [k, v] of repoSkillsCache) obj[k] = v;
+    sessionStorage.setItem(REPO_SKILLS_SS_KEY, JSON.stringify(obj));
+  } catch {
+    // sessionStorage full or unavailable; in-memory cache still works.
+  }
+}
+
+function repoCacheKey(owner: string, repo: string, branch: string) {
+  return `${owner}/${repo}/${branch}`;
+}
+
 export function InstallSkills() {
   const { t } = useTranslation();
   const { refreshPresets, refreshManagedSkills, managedSkills, openSkillDetailById } = useApp();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [activeTab, setActiveTab] = useState<"market" | "local" | "git">("market");
+  const [activeTab, setActiveTab] = useState<"market" | "local" | "git" | "repo">("market");
   const [marketTab, setMarketTab] = useState<"hot" | "trending" | "alltime">("alltime");
   const [marketQuery, setMarketQuery] = useState("");
   const [marketSourceFilter, setMarketSourceFilter] = useState("all");
@@ -66,6 +164,26 @@ export function InstallSkills() {
   const [gitPreviewRepoUrl, setGitPreviewRepoUrl] = useState<string | null>(null);
   const [gitSelections, setGitSelections] = useState<{ rel_path: string; name: string; description: string | null; selected: boolean }[]>([]);
   const [gitConfirmLoading, setGitConfirmLoading] = useState(false);
+  // --- Repo tab state ---
+  const [savedRepos, setSavedRepos] = useState<SavedRepo[]>(loadSavedRepos);
+  const [currentRepoId, setCurrentRepoId] = useState<string | null>(() => {
+    const saved = localStorage.getItem(CURRENT_REPO_LS_KEY);
+    const repos = loadSavedRepos();
+    if (saved && repos.some((r) => r.id === saved)) return saved;
+    return repos[0]?.id ?? null;
+  });
+  const [repoSkills, setRepoSkills] = useState<RepoSkillEntry[] | null>(null);
+  const [repoLoading, setRepoLoading] = useState(false);
+  const [repoError, setRepoError] = useState<string | null>(null);
+  const [repoSearch, setRepoSearch] = useState("");
+  const [repoInstalling, setRepoInstalling] = useState<Map<string, boolean>>(new Map());
+  const [addRepoOpen, setAddRepoOpen] = useState(false);
+  const [addRepoUrl, setAddRepoUrl] = useState("");
+  const [addRepoName, setAddRepoName] = useState("");
+  const [addRepoBranch, setAddRepoBranch] = useState("");
+  const [addRepoLoading, setAddRepoLoading] = useState(false);
+  const [repoDropdownOpen, setRepoDropdownOpen] = useState(false);
+  const repoDropdownRef = useRef<HTMLDivElement | null>(null);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [scanLoading, setScanLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -178,12 +296,12 @@ export function InstallSkills() {
 
   useEffect(() => {
     const tab = searchParams.get("tab");
-    if (tab === "market" || tab === "local" || tab === "git") {
+    if (tab === "market" || tab === "local" || tab === "git" || tab === "repo") {
       setActiveTab(tab);
     }
   }, [searchParams]);
 
-  const switchTab = (tab: "market" | "local" | "git") => {
+  const switchTab = (tab: "market" | "local" | "git" | "repo") => {
     setActiveTab(tab);
     setSearchParams({ tab });
   };
@@ -544,6 +662,161 @@ export function InstallSkills() {
     }
   };
 
+  const currentRepo = savedRepos.find((r) => r.id === currentRepoId) ?? null;
+
+  const loadRepoSkills = useCallback(async (repo: SavedRepo, force = false) => {
+    const key = repoCacheKey(repo.owner, repo.repo, repo.branch);
+    // Serve from cache (unless forced) so switching away and back doesn't
+    // re-fetch the GitHub tree every time.
+    if (!force) {
+      const cached = repoSkillsCache.get(key);
+      if (cached && Date.now() - cached.timestamp < REPO_SKILLS_CACHE_TTL_MS) {
+        setRepoSkills(cached.skills);
+        setRepoError(null);
+        return;
+      }
+    }
+    setRepoSkills(null);
+    setRepoLoading(true);
+    setRepoError(null);
+    try {
+      const skills = await api.listRepoSkills(repo.owner, repo.repo, repo.branch);
+      repoSkillsCache.set(key, { skills, timestamp: Date.now() });
+      persistRepoSkillsCache();
+      setRepoSkills(skills);
+    } catch (err) {
+      setRepoError(getErrorMessage(err, t("common.error")));
+    } finally {
+      setRepoLoading(false);
+    }
+  }, [t]);
+
+  const handleSelectRepo = useCallback((repo: SavedRepo) => {
+    setCurrentRepoId(repo.id);
+    setRepoSearch("");
+    setRepoDropdownOpen(false);
+    loadRepoSkills(repo);
+  }, [loadRepoSkills]);
+
+  const handleAddRepo = useCallback(async () => {
+    const url = addRepoUrl.trim();
+    if (!url) return;
+    // Parse GitHub URL into owner/repo
+    const cleaned = url.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "").replace(/\/$/, "");
+    const parts = cleaned.split("/");
+    if (parts.length < 2) {
+      toast.error(t("install.repo.invalidUrl", { defaultValue: "Invalid GitHub URL" }));
+      return;
+    }
+    const owner = parts[0];
+    const repo = parts[1];
+    const branch = addRepoBranch.trim() || "main";
+    const displayName = addRepoName.trim() || `${owner}/${repo}`;
+    setAddRepoLoading(true);
+    try {
+      const skills = await api.listRepoSkills(owner, repo, branch);
+      const newRepo: SavedRepo = { id: crypto.randomUUID(), name: displayName, owner, repo, branch, url, addedAt: Date.now() };
+      repoSkillsCache.set(repoCacheKey(owner, repo, branch), { skills, timestamp: Date.now() });
+      persistRepoSkillsCache();
+      const updated = [...savedRepos, newRepo];
+      setSavedRepos(updated);
+      saveSavedRepos(updated);
+      setCurrentRepoId(newRepo.id);
+      setRepoSkills(skills);
+      setAddRepoOpen(false);
+      setAddRepoUrl("");
+      setAddRepoName("");
+      setAddRepoBranch("");
+    } catch (err) {
+      toast.error(getErrorMessage(err, t("common.error")));
+    } finally {
+      setAddRepoLoading(false);
+    }
+  }, [addRepoUrl, addRepoName, addRepoBranch, savedRepos, t]);
+
+  const handleRemoveRepo = useCallback((repoId: string) => {
+    const updated = savedRepos.filter((r) => r.id !== repoId);
+    setSavedRepos(updated);
+    saveSavedRepos(updated);
+    if (currentRepoId === repoId) {
+      const next = updated[0] ?? null;
+      setCurrentRepoId(next?.id ?? null);
+      setRepoSkills(null);
+      if (next) loadRepoSkills(next);
+    }
+  }, [savedRepos, currentRepoId, loadRepoSkills]);
+
+  const handleInstallRepoSkill = useCallback(async (skill: api.RepoSkillEntry) => {
+    if (!currentRepo) return;
+    const key = skill.path;
+    setRepoInstalling((prev) => new Map(prev).set(key, true));
+    try {
+      await api.installRepoSkill(currentRepo.owner, currentRepo.repo, currentRepo.branch, skill.path, skill.name);
+      await refreshManagedSkills();
+      await refreshPresets();
+      toast.success(t("install.toast.success", { name: skill.name }));
+    } catch (err) {
+      toast.error(getErrorMessage(err, t("common.error")));
+    } finally {
+      setRepoInstalling((prev) => { const m = new Map(prev); m.delete(key); return m; });
+    }
+  }, [currentRepo, refreshManagedSkills, refreshPresets, t]);
+
+  const filteredRepoSkills = useMemo(() => {
+    if (!repoSkills) return [];
+    const q = repoSearch.trim().toLowerCase();
+    if (!q) return repoSkills;
+    return repoSkills.filter(
+      (s) => s.name.toLowerCase().includes(q) || (s.description?.toLowerCase().includes(q) ?? false)
+    );
+  }, [repoSkills, repoSearch]);
+
+  // Close repo dropdown on outside click
+  useEffect(() => {
+    if (!repoDropdownOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (!repoDropdownRef.current?.contains(e.target as Node)) {
+        setRepoDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [repoDropdownOpen]);
+
+  // Persist current repo selection across view unmount/remount.
+  useEffect(() => {
+    if (currentRepoId) {
+      localStorage.setItem(CURRENT_REPO_LS_KEY, currentRepoId);
+    } else {
+      localStorage.removeItem(CURRENT_REPO_LS_KEY);
+    }
+  }, [currentRepoId]);
+
+  // Auto-load skills when currentRepoId changes (first mount or repo selection)
+  useEffect(() => {
+    const repo = savedRepos.find((r) => r.id === currentRepoId) ?? null;
+    if (!repo || repoLoading) return;
+    // Restore from cache instantly (no loading flicker); only fetch when stale.
+    const key = repoCacheKey(repo.owner, repo.repo, repo.branch);
+    const cached = repoSkillsCache.get(key);
+    if (cached) {
+      const age = Date.now() - cached.timestamp;
+      console.debug("[repoSkills] cache hit", key, "age=" + age + "ms", "skills=" + cached.skills.length);
+      if (age >= REPO_SKILLS_CACHE_TTL_MS) {
+        loadRepoSkills(repo); // stale: background refresh
+      } else {
+        setRepoSkills(cached.skills);
+        setRepoError(null);
+      }
+      return;
+    }
+    console.debug("[repoSkills] cache miss, fetching", key);
+    if (repoSkills === null) {
+      loadRepoSkills(repo);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentRepoId]);
+
   const handleImportDiscovered = async (sourcePath: string, name: string) => {
     setImportingPaths((prev) => new Set(prev).add(sourcePath));
     try {
@@ -724,6 +997,7 @@ export function InstallSkills() {
             { id: "market" as const, label: t("install.browseMarket"), icon: Box },
             { id: "local" as const, label: t("install.localInstall"), icon: UploadCloud },
             { id: "git" as const, label: t("install.gitInstall"), icon: Github },
+            { id: "repo" as const, label: t("install.repoTab"), icon: Database },
           ].map((tab) => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
@@ -1506,6 +1780,258 @@ export function InstallSkills() {
                 )}
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "repo" && (
+        <div className="animate-in fade-in duration-300">
+          <div className="flex flex-col gap-3">
+            {/* Top bar */}
+            <div className="app-panel flex items-center gap-2 p-3">
+              {/* Left: current repo name */}
+              <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-primary bg-accent border border-border rounded-md px-2.5 py-1 truncate max-w-[200px] shrink-0">
+                <Database className="w-3.5 h-3.5 shrink-0 text-muted" />
+                {currentRepo ? currentRepo.name : t("install.repo.empty")}
+              </span>
+
+              {/* Center: search */}
+              <div className="relative flex-1 min-w-0">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted pointer-events-none" />
+                <input
+                  type="text"
+                  className="app-input w-full bg-background pl-8 pr-3"
+                  placeholder={t("install.repo.searchPlaceholder")}
+                  value={repoSearch}
+                  onChange={(e) => setRepoSearch(e.target.value)}
+                  disabled={!currentRepo}
+                />
+                {repoSearch && (
+                  <button
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-secondary"
+                    onClick={() => setRepoSearch("")}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Right: repo switcher dropdown + add button */}
+              <div className="flex items-center gap-1.5 shrink-0">
+                {savedRepos.length > 0 && (
+                  <div className="relative" ref={repoDropdownRef}>
+                    <button
+                      className="inline-flex items-center gap-1 rounded-lg border border-border bg-surface-hover px-2 py-1.5 text-[12px] font-medium text-secondary transition-colors hover:bg-surface-active"
+                      onClick={() => setRepoDropdownOpen((v) => !v)}
+                      title={t("install.repo.switchRepo")}
+                    >
+                      <ChevronDown className="w-3.5 h-3.5" />
+                    </button>
+                    {repoDropdownOpen && (
+                      <div className="absolute right-0 top-full mt-1 z-50 min-w-[200px] rounded-xl border border-border bg-surface shadow-lg py-1 overflow-hidden">
+                        {savedRepos.map((repo) => (
+                          <div
+                            key={repo.id}
+                            className="flex items-center justify-between px-3 py-1.5 hover:bg-surface-hover cursor-pointer group"
+                            onClick={() => handleSelectRepo(repo)}
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              {repo.id === currentRepoId && <Check className="w-3.5 h-3.5 text-accent-light shrink-0" />}
+                              {repo.id !== currentRepoId && <span className="w-3.5 shrink-0" />}
+                              <span className="text-[13px] truncate text-secondary">{repo.name}</span>
+                            </div>
+                            <button
+                              className="text-muted hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity ml-2 shrink-0"
+                              onClick={(e) => { e.stopPropagation(); handleRemoveRepo(repo.id); }}
+                              title={t("install.repo.removeRepo")}
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                <button
+                  className="inline-flex items-center gap-1 rounded-lg border border-border bg-surface-hover px-2 py-1.5 text-[12px] font-medium text-secondary transition-colors hover:bg-surface-active disabled:opacity-40"
+                  onClick={() => currentRepo && loadRepoSkills(currentRepo, true)}
+                  disabled={!currentRepo || repoLoading}
+                  title={t("install.repo.retry")}
+                >
+                  <RefreshCw className={cn("w-3.5 h-3.5", repoLoading && "animate-spin")} />
+                </button>
+                <button
+                  className="inline-flex items-center gap-1 rounded-lg border border-border bg-surface-hover px-2 py-1.5 text-[12px] font-medium text-secondary transition-colors hover:bg-surface-active"
+                  onClick={() => setAddRepoOpen(true)}
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  {t("install.repo.addRepo")}
+                </button>
+              </div>
+            </div>
+
+            {/* Add repo form */}
+            {addRepoOpen && (
+              <div className="app-panel flex flex-col gap-3 p-4">
+                <h3 className="text-[13px] font-semibold text-secondary">{t("install.repo.addRepoTitle")}</h3>
+                <div className="flex flex-col gap-2">
+                  <label className="text-[12px] font-medium text-muted">{t("install.repo.repoUrl")}</label>
+                  <input
+                    type="text"
+                    className="app-input w-full bg-background"
+                    placeholder={t("install.repo.repoUrlPlaceholder")}
+                    value={addRepoUrl}
+                    onChange={(e) => setAddRepoUrl(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && !addRepoLoading && addRepoUrl.trim()) handleAddRepo(); }}
+                    autoFocus
+                  />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <label className="text-[12px] font-medium text-muted">{t("install.repo.repoName")}</label>
+                  <input
+                    type="text"
+                    className="app-input w-full bg-background"
+                    placeholder={t("install.repo.repoNamePlaceholder")}
+                    value={addRepoName}
+                    onChange={(e) => setAddRepoName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter" && !addRepoLoading && addRepoUrl.trim()) handleAddRepo(); }}
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    className="px-3 py-1.5 text-[13px] font-medium text-muted hover:text-secondary transition-colors"
+                    onClick={() => { setAddRepoOpen(false); setAddRepoUrl(""); setAddRepoName(""); }}
+                    disabled={addRepoLoading}
+                  >
+                    {t("install.repo.cancel")}
+                  </button>
+                  <button
+                    className="app-button-primary"
+                    onClick={handleAddRepo}
+                    disabled={!addRepoUrl.trim() || addRepoLoading}
+                  >
+                    {addRepoLoading ? (
+                      <><Loader2 className="w-3.5 h-3.5 animate-spin" />{t("install.repo.adding")}</>
+                    ) : t("install.repo.add")}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Content area */}
+            {savedRepos.length === 0 && !addRepoOpen && (
+              <div className="app-panel flex flex-col items-center justify-center py-16 gap-3 text-center">
+                <Database className="w-8 h-8 text-muted" />
+                <p className="text-[14px] font-semibold text-secondary">{t("install.repo.empty")}</p>
+                <p className="text-[13px] text-muted max-w-xs">{t("install.repo.emptyHint")}</p>
+                <button className="app-button-primary mt-2" onClick={() => setAddRepoOpen(true)}>
+                  <Plus className="w-3.5 h-3.5" />
+                  {t("install.repo.addRepo")}
+                </button>
+              </div>
+            )}
+
+            {savedRepos.length > 0 && repoLoading && (
+              <div className="app-panel flex items-center justify-center py-12 gap-2">
+                <Loader2 className="w-5 h-5 animate-spin text-muted" />
+                <span className="text-[13px] text-muted">{t("install.repo.loading")}</span>
+              </div>
+            )}
+
+            {savedRepos.length > 0 && repoError && !repoLoading && (
+              <div className="app-panel flex flex-col items-center justify-center py-10 gap-3">
+                <p className="text-[13px] text-red-400">{t("install.repo.loadError")}: {repoError}</p>
+                <button
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface-hover px-3 py-2 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-active"
+                  onClick={() => currentRepo && loadRepoSkills(currentRepo, true)}
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />{t("install.repo.retry")}
+                </button>
+              </div>
+            )}
+
+            {savedRepos.length > 0 && repoSkills && !repoLoading && (
+              <div className="app-panel flex flex-col gap-2 p-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[12px] text-muted">
+                    {t("install.repo.skillCount", { count: filteredRepoSkills.length })}
+                  </span>
+                </div>
+
+                {filteredRepoSkills.length === 0 && repoSearch && (
+                  <div className="flex flex-col items-center justify-center py-10 gap-2 text-center">
+                    <p className="text-[13px] font-medium text-secondary">{t("install.repo.noMatch")}</p>
+                    <p className="text-[12px] text-muted">{t("install.repo.noMatchHint")}</p>
+                  </div>
+                )}
+
+                {filteredRepoSkills.length === 0 && !repoSearch && (
+                  <div className="flex flex-col items-center justify-center py-10 gap-2 text-center">
+                    <p className="text-[13px] font-medium text-secondary">{t("install.repo.noSkills")}</p>
+                    <p className="text-[12px] text-muted">{t("install.repo.noSkillsHint")}</p>
+                  </div>
+                )}
+
+                {filteredRepoSkills.map((skill) => {
+                  const repoSourceRef = `https://github.com/${currentRepo!.owner}/${currentRepo!.repo}`;
+                  // Match by source_subpath (= skill.path) instead of name:
+                  // the install-time name can drift after a restart reindex
+                  // (SKILL.md frontmatter name vs directory name), but the
+                  // subpath is stable and uniquely identifies a skill within
+                  // a repo.
+                  const isInstalled = managedSkills.some(
+                    (s) => (s.source_ref === repoSourceRef || s.source_ref === currentRepo?.url)
+                      && (s.source_subpath ?? "") === skill.path
+                  );
+                  const isInstalling = repoInstalling.get(skill.path) ?? false;
+                  return (
+                    <div
+                      key={skill.path}
+                      className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-border-subtle hover:bg-surface-hover transition-colors"
+                    >
+                      <div className="flex flex-col min-w-0 flex-1">
+                        <span className="text-[13px] font-medium text-secondary truncate">{skill.name}</span>
+                        {skill.description && (
+                          <span className="text-[12px] text-muted truncate mt-0.5">{skill.description}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          className="shrink-0 text-[12px] rounded-[6px] inline-flex items-center gap-1 px-2.5 py-1.5 font-medium transition-colors border border-border bg-surface-hover text-secondary hover:bg-surface-active"
+                          onClick={() => {
+                            const base = `https://github.com/${currentRepo!.owner}/${currentRepo!.repo}`;
+                            const url = skill.path ? `${base}/tree/${currentRepo!.branch}/${skill.path}` : base;
+                            openUrl(url);
+                          }}
+                          title={t("install.viewOnWeb")}
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          className={cn(
+                            "shrink-0 text-[12px] rounded-[6px] inline-flex items-center gap-1 px-2.5 py-1.5 font-medium transition-colors",
+                            isInstalled
+                              ? "border border-emerald-500/20 bg-emerald-500/10 text-emerald-400 cursor-default"
+                              : "border border-accent-border bg-accent-dark text-white hover:bg-accent"
+                          )}
+                          onClick={() => !isInstalled && !isInstalling && handleInstallRepoSkill(skill)}
+                          disabled={isInstalled || isInstalling}
+                        >
+                          {isInstalling ? (
+                            <><Loader2 className="w-3.5 h-3.5 animate-spin" />{t("install.repo.installing")}</>
+                          ) : isInstalled ? (
+                            <><Check className="w-3.5 h-3.5" />{t("install.repo.installed")}</>
+                          ) : (
+                            <><DownloadCloud className="w-3.5 h-3.5" />{t("install.repo.install")}</>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       )}
