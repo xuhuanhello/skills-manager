@@ -24,6 +24,7 @@ import {
   Calendar,
   Database,
   ChevronDown,
+  SquareCheck,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -177,6 +178,14 @@ export function InstallSkills() {
   const [repoError, setRepoError] = useState<string | null>(null);
   const [repoSearch, setRepoSearch] = useState("");
   const [repoInstalling, setRepoInstalling] = useState<Map<string, boolean>>(new Map());
+  // --- Multi-select state (market tab) ---
+  const [isMarketMultiSelect, setIsMarketMultiSelect] = useState(false);
+  const [marketSelectedIds, setMarketSelectedIds] = useState<Set<string>>(new Set());
+  const [batchMarketInstalling, setBatchMarketInstalling] = useState(false);
+  // --- Multi-select state (repo tab) ---
+  const [isRepoMultiSelect, setIsRepoMultiSelect] = useState(false);
+  const [repoSelectedPaths, setRepoSelectedPaths] = useState<Set<string>>(new Set());
+  const [batchRepoInstalling, setBatchRepoInstalling] = useState(false);
   const [addRepoOpen, setAddRepoOpen] = useState(false);
   const [addRepoUrl, setAddRepoUrl] = useState("");
   const [addRepoName, setAddRepoName] = useState("");
@@ -771,6 +780,74 @@ export function InstallSkills() {
     );
   }, [repoSkills, repoSearch]);
 
+  const handleBatchInstallMarket = useCallback(async (skills: SkillsShSkill[]) => {
+    const toInstall = skills.filter((s) => !installedSourceRefs.has(`${s.source}/${s.skill_id}`));
+    const skipped = skills.length - toInstall.length;
+    if (toInstall.length === 0) {
+      toast.info(t("install.batchInstallDone", { success: 0, skipped, failed: 0 }));
+      setIsMarketMultiSelect(false);
+      setMarketSelectedIds(new Set());
+      return;
+    }
+    setBatchMarketInstalling(true);
+    const toastId = toast.loading(t("install.batchInstallProgress", { current: 0, total: toInstall.length }));
+    let success = 0;
+    let failed = 0;
+    for (let i = 0; i < toInstall.length; i++) {
+      const skill = toInstall[i];
+      toast.loading(t("install.batchInstallProgress", { current: i + 1, total: toInstall.length }), { id: toastId });
+      try {
+        await api.installFromSkillssh(skill.source, skill.skill_id);
+        success++;
+      } catch {
+        failed++;
+      }
+    }
+    await Promise.allSettled([refreshPresets(), refreshManagedSkills()]);
+    toast.success(t("install.batchInstallDone", { success, skipped, failed }), { id: toastId });
+    setIsMarketMultiSelect(false);
+    setMarketSelectedIds(new Set());
+    setBatchMarketInstalling(false);
+  }, [installedSourceRefs, refreshManagedSkills, refreshPresets, t]);
+
+  const handleBatchInstallRepo = useCallback(async (paths: Set<string>) => {
+    if (!currentRepo) return;
+    const skills = filteredRepoSkills.filter((s) => paths.has(s.path));
+    const repoSourceRef = `https://github.com/${currentRepo.owner}/${currentRepo.repo}`;
+    const toInstall = skills.filter(
+      (s) => !managedSkills.some(
+        (m) => (m.source_ref === repoSourceRef || m.source_ref === currentRepo.url)
+          && (m.source_subpath ?? "") === s.path
+      )
+    );
+    const skipped = skills.length - toInstall.length;
+    if (toInstall.length === 0) {
+      toast.info(t("install.batchInstallDone", { success: 0, skipped, failed: 0 }));
+      setIsRepoMultiSelect(false);
+      setRepoSelectedPaths(new Set());
+      return;
+    }
+    setBatchRepoInstalling(true);
+    const toastId = toast.loading(t("install.batchInstallProgress", { current: 0, total: toInstall.length }));
+    let success = 0;
+    let failed = 0;
+    for (let i = 0; i < toInstall.length; i++) {
+      const skill = toInstall[i];
+      toast.loading(t("install.batchInstallProgress", { current: i + 1, total: toInstall.length }), { id: toastId });
+      try {
+        await api.installRepoSkill(currentRepo.owner, currentRepo.repo, currentRepo.branch, skill.path, skill.name);
+        success++;
+      } catch {
+        failed++;
+      }
+    }
+    await Promise.allSettled([refreshManagedSkills(), refreshPresets()]);
+    toast.success(t("install.batchInstallDone", { success, skipped, failed }), { id: toastId });
+    setIsRepoMultiSelect(false);
+    setRepoSelectedPaths(new Set());
+    setBatchRepoInstalling(false);
+  }, [currentRepo, filteredRepoSkills, managedSkills, refreshManagedSkills, refreshPresets, t]);
+
   // Close repo dropdown on outside click
   useEffect(() => {
     if (!repoDropdownOpen) return;
@@ -1068,6 +1145,23 @@ export function InstallSkills() {
                       spellCheck={false}
                     />
                   </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsMarketMultiSelect((v) => !v);
+                      setMarketSelectedIds(new Set());
+                    }}
+                    className={cn(
+                      "rounded-md p-2 transition-colors outline-none shrink-0",
+                      isMarketMultiSelect
+                        ? "bg-accent-bg text-accent-light"
+                        : "text-muted hover:bg-surface-hover hover:text-secondary"
+                    )}
+                    title={isMarketMultiSelect ? t("common.cancel") : t("install.multiSelect")}
+                  >
+                    <SquareCheck className="h-4 w-4" />
+                  </button>
                 </div>
               </div>
 
@@ -1294,11 +1388,52 @@ export function InstallSkills() {
                       const avatarUrl = `https://github.com/${owner}.png?size=32`;
                       const sourceRef = `${skill.source}/${skill.skill_id}`;
                       const isInstalled = installedSourceRefs.has(sourceRef);
+                      const isSelected = marketSelectedIds.has(skill.id);
 
                       return (
+                      <div key={skill.id} className="relative">
+                        {isMarketMultiSelect && (
+                          <button
+                            type="button"
+                            className="absolute left-2 top-2 z-10 rounded p-0.5 transition-colors"
+                            onClick={() =>
+                              setMarketSelectedIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(skill.id)) next.delete(skill.id);
+                                else next.add(skill.id);
+                                return next;
+                              })
+                            }
+                            aria-label={isSelected ? t("common.deselect") : t("common.select")}
+                          >
+                            <SquareCheck
+                              className={cn(
+                                "h-4 w-4 transition-colors",
+                                isSelected ? "text-accent-light" : "text-muted"
+                              )}
+                            />
+                          </button>
+                        )}
                       <div
-                        key={skill.id}
-                        className="app-panel flex flex-col gap-2 p-3 transition-colors hover:border-border"
+                        className={cn(
+                          "app-panel flex flex-col gap-2 p-3 transition-colors",
+                          isMarketMultiSelect
+                            ? isSelected
+                              ? "border-accent-border cursor-pointer"
+                              : "cursor-pointer hover:border-border"
+                            : "hover:border-border"
+                        )}
+                        onClick={
+                          isMarketMultiSelect
+                            ? () =>
+                                setMarketSelectedIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(skill.id)) next.delete(skill.id);
+                                  else next.add(skill.id);
+                                  return next;
+                                })
+                            : undefined
+                        }
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -1391,6 +1526,7 @@ export function InstallSkills() {
                           ) : null}
                         </div>
                       </div>
+                      </div>
                       );
                     })}
                   </div>
@@ -1458,6 +1594,51 @@ export function InstallSkills() {
                       </button>
                     </div>
                   ) : null}
+
+                  {isMarketMultiSelect && (
+                    <div className="sticky bottom-4 mt-4 flex items-center gap-2 rounded-xl border border-border bg-surface/95 backdrop-blur px-4 py-2.5 shadow-lg">
+                      <span className="text-[13px] text-secondary shrink-0">
+                        {marketSelectedIds.size} 个已选
+                      </span>
+                      <button
+                        type="button"
+                        className="text-[13px] text-muted hover:text-secondary transition-colors"
+                        onClick={() => {
+                          if (marketSelectedIds.size === filteredMarketSkills.length) {
+                            setMarketSelectedIds(new Set());
+                          } else {
+                            setMarketSelectedIds(new Set(filteredMarketSkills.map((s) => s.id)));
+                          }
+                        }}
+                      >
+                        {marketSelectedIds.size === filteredMarketSkills.length ? "取消全选" : "全选"}
+                      </button>
+                      <div className="flex-1" />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleBatchInstallMarket(
+                            filteredMarketSkills.filter((s) => marketSelectedIds.has(s.id))
+                          )
+                        }
+                        disabled={marketSelectedIds.size === 0 || batchMarketInstalling}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-accent-border bg-accent-dark px-3 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-accent disabled:opacity-50"
+                      >
+                        {batchMarketInstalling && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        安装 {marketSelectedIds.size} 个
+                      </button>
+                      <button
+                        type="button"
+                        className="text-[13px] text-muted hover:text-secondary transition-colors"
+                        onClick={() => {
+                          setIsMarketMultiSelect(false);
+                          setMarketSelectedIds(new Set());
+                        }}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1957,7 +2138,51 @@ export function InstallSkills() {
                   <span className="text-[12px] text-muted">
                     {t("install.repo.skillCount", { count: filteredRepoSkills.length })}
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsRepoMultiSelect((v) => !v);
+                      setRepoSelectedPaths(new Set());
+                    }}
+                    className={cn(
+                      "rounded-md p-1.5 transition-colors outline-none",
+                      isRepoMultiSelect
+                        ? "bg-accent-bg text-accent-light"
+                        : "text-muted hover:bg-surface-hover hover:text-secondary"
+                    )}
+                    title={isRepoMultiSelect ? t("common.cancel") : t("install.multiSelect")}
+                  >
+                    <SquareCheck className="h-3.5 w-3.5" />
+                  </button>
                 </div>
+
+                {isRepoMultiSelect && repoSelectedPaths.size > 0 && (
+                  <div className="flex items-center gap-2 rounded-lg border border-border bg-surface/95 px-3 py-2 mb-1">
+                    <span className="text-[13px] text-secondary shrink-0">
+                      {repoSelectedPaths.size} 个已选
+                    </span>
+                    <div className="flex-1" />
+                    <button
+                      type="button"
+                      onClick={() => handleBatchInstallRepo(repoSelectedPaths)}
+                      disabled={batchRepoInstalling}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-accent-border bg-accent-dark px-3 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-accent disabled:opacity-50"
+                    >
+                      {batchRepoInstalling && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                      安装 {repoSelectedPaths.size} 个
+                    </button>
+                    <button
+                      type="button"
+                      className="text-[13px] text-muted hover:text-secondary transition-colors"
+                      onClick={() => {
+                        setIsRepoMultiSelect(false);
+                        setRepoSelectedPaths(new Set());
+                      }}
+                    >
+                      取消
+                    </button>
+                  </div>
+                )}
 
                 {filteredRepoSkills.length === 0 && repoSearch && (
                   <div className="flex flex-col items-center justify-center py-10 gap-2 text-center">
@@ -1985,11 +2210,53 @@ export function InstallSkills() {
                       && (s.source_subpath ?? "") === skill.path
                   );
                   const isInstalling = repoInstalling.get(skill.path) ?? false;
+                  const isRepoSelected = repoSelectedPaths.has(skill.path);
                   return (
                     <div
                       key={skill.path}
-                      className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border border-border-subtle hover:bg-surface-hover transition-colors"
+                      className={cn(
+                        "flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border transition-colors",
+                        isRepoMultiSelect
+                          ? isRepoSelected
+                            ? "border-accent-border hover:bg-surface-hover cursor-pointer"
+                            : "border-border-subtle hover:bg-surface-hover cursor-pointer"
+                          : "border-border-subtle hover:bg-surface-hover"
+                      )}
+                      onClick={
+                        isRepoMultiSelect
+                          ? () =>
+                              setRepoSelectedPaths((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(skill.path)) next.delete(skill.path);
+                                else next.add(skill.path);
+                                return next;
+                              })
+                          : undefined
+                      }
                     >
+                      {isRepoMultiSelect && (
+                        <button
+                          type="button"
+                          className="shrink-0 p-0.5 transition-colors"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setRepoSelectedPaths((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(skill.path)) next.delete(skill.path);
+                              else next.add(skill.path);
+                              return next;
+                            });
+                          }}
+                          aria-label={isRepoSelected ? t("common.deselect") : t("common.select")}
+                        >
+                          <SquareCheck
+                            className={cn(
+                              "h-4 w-4 transition-colors",
+                              isRepoSelected ? "text-accent-light" : "text-muted"
+                            )}
+                          />
+                        </button>
+                      )}
                       <div className="flex flex-col min-w-0 flex-1">
                         <span className="text-[13px] font-medium text-secondary truncate">{skill.name}</span>
                         {skill.description && (

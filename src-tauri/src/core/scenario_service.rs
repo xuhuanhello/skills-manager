@@ -573,6 +573,16 @@ pub enum BatchApplyMode {
     Remove,
 }
 
+/// Aggregate outcome of a [`apply_skills_to_tools`] batch. `applied` counts
+/// every pair processed (including idempotent re-syncs of an already-synced
+/// pair, since `insert_target` upserts), `failed` counts pairs whose
+/// sync/insert/remove raised an error.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BatchApplyResult {
+    pub applied: usize,
+    pub failed: usize,
+}
+
 /// Apply a batch of `(skill_id × tool_key)` pairs in either Add or Remove mode
 /// without touching `active_scenario_id` or `scenario_skill_tools` toggles.
 ///
@@ -591,9 +601,9 @@ pub fn apply_skills_to_tools(
     skill_ids: &[String],
     tool_keys: &[String],
     mode: BatchApplyMode,
-) -> Result<(), AppError> {
+) -> Result<BatchApplyResult, AppError> {
     if skill_ids.is_empty() || tool_keys.is_empty() {
-        return Ok(());
+        return Ok(BatchApplyResult::default());
     }
 
     match mode {
@@ -606,7 +616,7 @@ fn apply_add(
     store: &SkillStore,
     skill_ids: &[String],
     tool_keys: &[String],
-) -> Result<(), AppError> {
+) -> Result<BatchApplyResult, AppError> {
     let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
     let disabled = tool_service::get_disabled_tools(store);
 
@@ -630,7 +640,7 @@ fn apply_add(
         adapters.insert(key.clone(), adapter);
     }
 
-    let mut synced = 0usize;
+    let mut applied = 0usize;
     let mut failed = 0usize;
     for skill_id in skill_ids {
         let Ok(Some(skill)) = store.get_skill_by_id(skill_id) else {
@@ -662,7 +672,7 @@ fn apply_add(
                         );
                         failed += 1;
                     } else {
-                        synced += 1;
+                        applied += 1;
                     }
                 }
                 Err(e) => {
@@ -678,18 +688,45 @@ fn apply_add(
     }
 
     log::info!(
-        "apply_skills_to_tools(Add): skills={} tools={} synced={synced} failed={failed}",
+        "apply_skills_to_tools(Add): skills={} tools={} applied={applied} failed={failed}",
         skill_ids.len(),
         adapters.len(),
     );
-    Ok(())
+
+    // Mirror what sync_skill_to_tool does: also flip the scenario_skill_tools
+    // toggle so the detail panel's agent checkboxes reflect the new state.
+    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
+        let scenario_skill_ids = store
+            .get_skill_ids_for_scenario(&active_id)
+            .unwrap_or_default();
+        let all_adapter_keys: Vec<String> = tool_adapters::enabled_installed_adapters(store)
+            .iter()
+            .map(|a| a.key.clone())
+            .collect();
+        for skill_id in skill_ids {
+            if !scenario_skill_ids.contains(skill_id) {
+                continue;
+            }
+            let _ = store.ensure_scenario_skill_tool_defaults(
+                &active_id,
+                skill_id,
+                &all_adapter_keys,
+            );
+            for tool_key in adapters.keys() {
+                let _ =
+                    store.set_scenario_skill_tool_enabled(&active_id, skill_id, tool_key, true);
+            }
+        }
+    }
+
+    Ok(BatchApplyResult { applied, failed })
 }
 
 fn apply_remove(
     store: &SkillStore,
     skill_ids: &[String],
     tool_keys: &[String],
-) -> Result<(), AppError> {
+) -> Result<BatchApplyResult, AppError> {
     let tool_set: HashSet<&String> = tool_keys.iter().collect();
 
     let mut to_delete: Vec<(String, String, PathBuf)> = Vec::new();
@@ -707,7 +744,7 @@ fn apply_remove(
     }
 
     if to_delete.is_empty() {
-        return Ok(());
+        return Ok(BatchApplyResult::default());
     }
 
     // Phase 1: drop the DB rows first so the post-delete recount below sees
@@ -754,7 +791,35 @@ fn apply_remove(
         "apply_skills_to_tools(Remove): pairs={} fs_removed={removed}",
         to_delete.len(),
     );
-    Ok(())
+
+    // Mirror what unsync_skill_from_tool does: flip the scenario_skill_tools
+    // toggle to false so the detail panel reflects the removal immediately.
+    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
+        let scenario_skill_ids = store
+            .get_skill_ids_for_scenario(&active_id)
+            .unwrap_or_default();
+        let all_adapter_keys: Vec<String> = tool_adapters::enabled_installed_adapters(store)
+            .iter()
+            .map(|a| a.key.clone())
+            .collect();
+        for (skill_id, tool_key, _) in &to_delete {
+            if !scenario_skill_ids.contains(skill_id) {
+                continue;
+            }
+            let _ = store.ensure_scenario_skill_tool_defaults(
+                &active_id,
+                skill_id,
+                &all_adapter_keys,
+            );
+            let _ =
+                store.set_scenario_skill_tool_enabled(&active_id, skill_id, tool_key, false);
+        }
+    }
+
+    Ok(BatchApplyResult {
+        applied: to_delete.len(),
+        failed: 0,
+    })
 }
 
 #[cfg(test)]

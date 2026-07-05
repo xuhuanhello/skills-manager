@@ -432,6 +432,37 @@ pub async fn apply_preset_to_coding_agents(
             return Ok(());
         }
         scenario_service::apply_skills_to_tools(&store, &skill_ids, &tool_keys, mode.into())
+            .map(|_| ())
+    })
+    .await?;
+    if result.is_ok() {
+        refresh_tray_menu_best_effort(&app);
+    }
+    result
+}
+
+/// Apply (add) or remove a specific set of skills against a specific set of
+/// tool keys in a single batch. This is the generic primitive the in-app
+/// `PresetBar` uses when activating/deactivating a preset against a scoped set
+/// of agents (a single agent in the agent-detail view, or every coding agent
+/// in the overview). Replaces the previous front-end loop that fired one IPC
+/// round-trip per `(skill, tool)` pair.
+///
+/// Unlike [`sync_skill_to_tool`]/[`unsync_skill_from_tool`] this does NOT touch
+/// `scenario_skill_tools` toggles or `active_scenario_id` — mirroring the tray
+/// path ([`apply_preset_to_coding_agents`]). The batch is a pure
+/// write/remove-files + maintain-`skill_targets` operation.
+#[tauri::command]
+pub async fn batch_apply_skills(
+    app: tauri::AppHandle,
+    skill_ids: Vec<String>,
+    tool_keys: Vec<String>,
+    mode: PresetApplyMode,
+    store: State<'_, Arc<SkillStore>>,
+) -> Result<scenario_service::BatchApplyResult, AppError> {
+    let store = store.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        scenario_service::apply_skills_to_tools(&store, &skill_ids, &tool_keys, mode.into())
     })
     .await?;
     if result.is_ok() {

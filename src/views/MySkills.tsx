@@ -7,6 +7,7 @@ import {
   Github,
   HardDrive,
   Globe,
+  Globe2,
   Layers,
   RefreshCw,
   RotateCcw,
@@ -36,6 +37,7 @@ import { DeleteSkillButton } from "../components/DeleteSkillButton";
 import { SkillDetailPanel } from "../components/SkillDetailPanel";
 import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
 import { BatchTagDialog } from "../components/BatchTagDialog";
+import { BatchSyncAgentsSheet } from "../components/BatchSyncAgentsSheet";
 import { GitSetupDialog } from "../components/GitSetupDialog";
 import { GitRecoveryDialog } from "../components/GitRecoveryDialog";
 import { SyncDots } from "../components/SyncDots";
@@ -134,6 +136,7 @@ export function MySkills() {
     viewedPreset,
     tools,
     managedSkills: skills,
+    refreshTools,
     refreshPresets,
     refreshManagedSkills,
     detailSkillId,
@@ -157,6 +160,7 @@ export function MySkills() {
   const refreshAfterDeleteRef = useRef<number | null>(null);
   const [batchDeleteConfirm, setBatchDeleteConfirm] = useState(false);
   const [batchTagDialogOpen, setBatchTagDialogOpen] = useState(false);
+  const [batchSyncAgentsOpen, setBatchSyncAgentsOpen] = useState(false);
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingSkillId, setCheckingSkillId] = useState<string | null>(null);
   const [updatingSkillId, setUpdatingSkillId] = useState<string | null>(null);
@@ -1518,6 +1522,16 @@ export function MySkills() {
           onSelectAll={handleSelectAll}
           onCancel={exitMultiSelect}
           onEditTags={() => setBatchTagDialogOpen(true)}
+          extraActions={
+            <button
+              onClick={() => setBatchSyncAgentsOpen(true)}
+              disabled={selectedIds.size === 0}
+              className="inline-flex items-center gap-1.5 rounded-md bg-sky-600/90 px-2.5 py-1 text-[13px] font-medium text-white transition-colors hover:bg-sky-500 disabled:opacity-50"
+            >
+              <Globe2 className="h-3.5 w-3.5" />
+              {t("mySkills.batchSyncAgents.button", { count: selectedIds.size })}
+            </button>
+          }
         />
       )}
 
@@ -2046,6 +2060,15 @@ export function MySkills() {
         allTags={allTags}
         onClose={() => setBatchTagDialogOpen(false)}
         onApply={handleBatchEditTags}
+      />
+      <BatchSyncAgentsSheet
+        open={batchSyncAgentsOpen}
+        skills={skills.filter((s) => selectedIds.has(s.id))}
+        tools={tools}
+        onClose={() => setBatchSyncAgentsOpen(false)}
+        onApplied={async () => {
+          await Promise.all([refreshManagedSkills(), refreshTools()]);
+        }}
       />
       <ConfirmDialog
         open={restoreVersionTag !== null}

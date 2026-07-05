@@ -37,3 +37,7 @@ reference
 CLAUDE.md
 .loop-log
 
+# Local tooling (not part of the upstream project)
+.firecrawl
+.pi
+

@@ -15,6 +15,9 @@ export interface ToolInfo {
   project_relative_skills_dir: string | null;
   has_project_path_override: boolean;
   category: ToolCategory;
+  /** Number of skill directories currently on disk in this tool's skills_dir.
+   *  Counted at query time — always reflects the real filesystem state. */
+  skill_count: number;
 }
 
 export interface ManagedSkill {
@@ -383,6 +386,22 @@ export const syncSkillToTool = (skillId: string, tool: string) =>
 
 export const unsyncSkillFromTool = (skillId: string, tool: string) =>
   invoke<void>("unsync_skill_from_tool", { skillId, tool });
+
+export interface BatchApplyResult {
+  applied: number;
+  failed: number;
+}
+
+/** Apply (add) or remove a set of skills against a set of agent tool keys in
+ * one batch round-trip. Replaces the front-end `for` loop that fired a Tauri
+ * command per `(skill, tool)` pair. Mirrors the tray-side batch primitive — it
+ * skips the per-preset toggle bookkeeping that `sync_skill_to_tool` does. */
+export const batchApplySkills = (
+  skillIds: string[],
+  toolKeys: string[],
+  mode: "add" | "remove",
+) =>
+  invoke<BatchApplyResult>("batch_apply_skills", { skillIds, toolKeys, mode });
 
 export const getSkillToolToggles = (skillId: string, presetId: string) =>
   invoke<SkillToolToggle[]>("get_skill_tool_toggles", { skillId, presetId });

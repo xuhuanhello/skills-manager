@@ -1,4 +1,5 @@
 import { Trash2, CheckCircle2, Circle, RotateCcw, Tag, Download, Upload } from "lucide-react";
+import type { ReactNode } from "react";
 import { cn } from "../utils";
 
 interface MultiSelectToolbarLabels {
@@ -36,6 +37,9 @@ interface MultiSelectToolbarProps {
   onSelectAll: () => void;
   onCancel: () => void;
   onEditTags?: () => void;
+  /** Optional custom actions rendered before the delete/enable buttons.
+   *  Used for view-specific batch operations such as "set global agents". */
+  extraActions?: ReactNode;
 }
 
 export function MultiSelectToolbar({
@@ -58,6 +62,7 @@ export function MultiSelectToolbar({
   onSelectAll,
   onCancel,
   onEditTags,
+  extraActions,
 }: MultiSelectToolbarProps) {
   return (
     <div className="flex items-center gap-2 px-1 py-1.5">
@@ -66,6 +71,7 @@ export function MultiSelectToolbar({
       </span>
       {selectedCount > 0 && (
         <>
+          {extraActions}
           {anyUpdatable && labels.update && onUpdate && (
             <button
               onClick={onUpdate}

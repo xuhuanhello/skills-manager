@@ -14,6 +14,8 @@ import {
   CircleSlash,
   Trash2,
   Upload,
+  SquareCheck,
+  Square,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -21,6 +23,8 @@ import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PresetBar } from "../components/PresetBar";
+import { MultiSelectToolbar } from "../components/MultiSelectToolbar";
+import { useMultiSelect } from "../hooks/useMultiSelect";
 import { AgentIcon } from "../components/AgentIcon";
 import { DetailSheet } from "../components/DetailSheet";
 import { SkillMarkdown } from "../components/SkillMarkdown";
@@ -56,6 +60,9 @@ function WorkspaceSkillCard({
   active = false,
   actions,
   actionsHover = false,
+  selectable = false,
+  selected = false,
+  onToggleSelect,
   onClick,
 }: {
   viewMode: "grid" | "list";
@@ -67,17 +74,37 @@ function WorkspaceSkillCard({
   active?: boolean;
   actions?: ReactNode;
   actionsHover?: boolean;
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
   onClick: () => void;
 }) {
+  const selectionBox = selectable && onToggleSelect ? (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggleSelect();
+      }}
+      className="shrink-0 rounded-[4px] p-1 text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
+      title=""
+    >
+      {selected
+        ? <SquareCheck className="h-4 w-4 text-accent" />
+        : <Square className="h-4 w-4" />}
+    </button>
+  ) : null;
   if (viewMode === "list") {
     return (
       <div
         className={cn(
           "app-panel group relative flex cursor-pointer items-center gap-3.5 rounded-xl border-transparent px-3.5 py-3 transition-all hover:border-border hover:bg-surface-hover",
-          active && "border-l-2 border-l-accent"
+          active && "border-l-2 border-l-accent",
+          selectable && selected && "border-accent bg-accent/8"
         )}
         onClick={onClick}
       >
+        {selectionBox}
         <h3
           className="w-[180px] shrink-0 truncate text-[14px] font-semibold text-secondary group-hover:text-primary"
           title={title}
@@ -131,11 +158,13 @@ function WorkspaceSkillCard({
     <div
       className={cn(
         "app-panel group relative flex h-full cursor-pointer flex-col overflow-hidden transition-all hover:border-border hover:bg-surface-hover",
-        active && "border-l-2 border-l-accent"
+        active && "border-l-2 border-l-accent",
+        selectable && selected && "border-accent bg-accent/8"
       )}
       onClick={onClick}
     >
       <div className="flex items-center gap-2.5 px-3.5 pt-3 pb-1.5">
+        {selectionBox}
         <h3
           className="flex-1 truncate text-[14px] font-semibold text-primary group-hover:text-accent-light"
           title={title}
@@ -404,6 +433,95 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
     [localSkills, managedLocalIds]
   );
 
+  const localSkillKey = useCallback(
+    (skill: ProjectSkill) => `${skill.agent}:${skill.relative_path}`,
+    []
+  );
+
+  const {
+    isMultiSelect: isLocalMultiSelect,
+    setIsMultiSelect: setIsLocalMultiSelect,
+    selectedIds: localSelectedIds,
+    toggleSelect: toggleLocalSelect,
+    isAllSelected: localAllSelected,
+    anyDisabled: localAnyDisabled,
+    handleSelectAll: handleLocalSelectAll,
+    exitMultiSelect: exitLocalMultiSelect,
+  } = useMultiSelect<ProjectSkill>({
+    items: localSkills,
+    filtered: visibleLocalSkills,
+    getKey: localSkillKey,
+    isItemActive: () => true,
+  });
+
+  const [, setLocalBatchRemoving] = useState(false);
+  const [localBatchPulling, setLocalBatchPulling] = useState(false);
+  const [localBatchUploading, setLocalBatchUploading] = useState(false);
+  const [localBatchDeleteConfirm, setLocalBatchDeleteConfirm] = useState(false);
+
+  const localSelectedSkills = useMemo(
+    () => localSkills.filter((s) => localSelectedIds.has(localSkillKey(s))),
+    [localSkills, localSelectedIds, localSkillKey]
+  );
+
+  // Batch operations on the single-agent local skill list. These reuse the
+  // existing per-skill agent-workspace primitives (no batch backend today) but
+  // fan them out in a single Promise.allSettled to avoid the old N×serial
+  // `await` pattern.
+  const handleLocalBatchDelete = async () => {
+    if (!agentKey || localSelectedSkills.length === 0) return;
+    setLocalBatchRemoving(true);
+    const results = await Promise.allSettled(
+      localSelectedSkills.map((s) => api.deleteGlobalLocalSkill(s.agent, s.relative_path)),
+    );
+    const removed = results.filter((r) => r.status === "fulfilled").length;
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (removed > 0) toast.success(t("globalWorkspace.localSkills.batchDeletedShort", { count: removed }));
+    if (failed > 0) toast.error(t("globalWorkspace.localSkills.batchRemoveFailed", { count: failed }));
+    setLocalBatchRemoving(false);
+    setLocalBatchDeleteConfirm(false);
+    exitLocalMultiSelect();
+    await Promise.all([loadLocalSkills(), refreshManagedSkills()]);
+  };
+
+  const handleLocalBatchPull = async () => {
+    if (!agentKey) return;
+    const eligible = localSelectedSkills.filter(
+      (s) => s.sync_status === "center_newer" || s.sync_status === "diverged",
+    );
+    if (eligible.length === 0) return;
+    setLocalBatchPulling(true);
+    const results = await Promise.allSettled(
+      eligible.map((s) => api.updateGlobalLocalSkillFromCenter(s.agent, s.relative_path)),
+    );
+    const pulled = results.filter((r) => r.status === "fulfilled").length;
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (pulled > 0) toast.success(t("globalWorkspace.localSkills.batchPulledShort", { count: pulled }));
+    if (failed > 0) toast.error(t("globalWorkspace.localSkills.batchPullFailed", { count: failed }));
+    setLocalBatchPulling(false);
+    exitLocalMultiSelect();
+    await Promise.all([loadLocalSkills(), refreshManagedSkills()]);
+  };
+
+  const handleLocalBatchUpload = async () => {
+    if (!agentKey) return;
+    const eligible = localSelectedSkills.filter(
+      (s) => s.sync_status !== "in_sync" && !!s.center_skill_id,
+    );
+    if (eligible.length === 0) return;
+    setLocalBatchUploading(true);
+    const results = await Promise.allSettled(
+      eligible.map((s) => api.importGlobalLocalSkillToCenter(s.agent, s.relative_path)),
+    );
+    const uploaded = results.filter((r) => r.status === "fulfilled").length;
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (uploaded > 0) toast.success(t("globalWorkspace.localSkills.batchUploadedShort", { count: uploaded }));
+    if (failed > 0) toast.error(t("globalWorkspace.localSkills.batchUploadFailed", { count: failed }));
+    setLocalBatchUploading(false);
+    exitLocalMultiSelect();
+    await Promise.all([loadLocalSkills(), refreshManagedSkills()]);
+  };
+
   const handleRemoveLocalManagedSkill = async (skill: ProjectSkill) => {
     if (!agentKey || !skill.center_skill_id || !managedLocalIds.has(skill.center_skill_id)) return;
     setRemovingLocalSkillId(skill.relative_path);
@@ -533,6 +651,12 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
   const handlePresetRemove = useCallback(async (skill: ManagedSkill, agentK: string) => {
     await api.unsyncSkillFromTool(skill.id, agentK);
   }, []);
+
+  const handlePresetBatchApply = useCallback(
+    (skillIds: string[], toolKeys: string[], mode: "add" | "remove") =>
+      api.batchApplySkills(skillIds, toolKeys, mode),
+    [],
+  );
 
   const handlePresetComplete = useCallback(async () => {
     await Promise.all([refreshManagedSkills(), refreshTools(), loadLocalSkills()]);
@@ -674,6 +798,7 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
               existsInWorkspace={existsInGlobal}
               onAddSkill={handlePresetAdd}
               onRemoveSkill={handlePresetRemove}
+              onBatchApply={handlePresetBatchApply}
               onComplete={handlePresetComplete}
             />
           )}
@@ -783,8 +908,50 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
               <Plus className="h-3.5 w-3.5" />
               {t("globalWorkspace.addSkill")}
             </button>
+
+            <button
+              onClick={() => isLocalMultiSelect ? exitLocalMultiSelect() : setIsLocalMultiSelect(true)}
+              className={cn(
+                "rounded-md p-2 transition-colors outline-none",
+                isLocalMultiSelect ? "bg-surface-active text-secondary" : "text-muted hover:text-tertiary"
+              )}
+              title={isLocalMultiSelect ? t("globalWorkspace.localSkills.cancelSelect") : t("globalWorkspace.localSkills.selectMode")}
+            >
+              <SquareCheck className="h-4 w-4" />
+            </button>
           </div>
         </div>
+
+        {isLocalMultiSelect && (
+          <MultiSelectToolbar
+            selectedCount={localSelectedIds.size}
+            isAllSelected={localAllSelected}
+            anyDisabled={localAnyDisabled}
+            anyUpdatable={localSelectedSkills.some((s) => s.sync_status === "center_newer" || s.sync_status === "diverged")}
+            anyCanUpdateCenter={localSelectedSkills.some((s) => s.sync_status !== "in_sync" && !!s.center_skill_id)}
+            showToggle={false}
+            updating={localBatchPulling}
+            updatingCenter={localBatchUploading}
+            labels={{
+              hint: t("globalWorkspace.localSkills.selectHint"),
+              selected: t("globalWorkspace.localSkills.selectedCount", { count: localSelectedIds.size }),
+              update: t("globalWorkspace.localSkills.batchPull", { count: localSelectedSkills.filter((s) => s.sync_status === "center_newer" || s.sync_status === "diverged").length }),
+              updateCenter: t("globalWorkspace.localSkills.batchUpload", { count: localSelectedSkills.filter((s) => s.sync_status !== "in_sync" && !!s.center_skill_id).length }),
+              delete: t("globalWorkspace.localSkills.deleteSelected", { count: localSelectedIds.size }),
+              enable: "",
+              disable: "",
+              selectAll: t("globalWorkspace.selectAll"),
+              deselectAll: t("globalWorkspace.deselectAll"),
+              cancel: t("common.cancel"),
+            }}
+            onUpdate={handleLocalBatchPull}
+            onUpdateCenter={handleLocalBatchUpload}
+            onDelete={() => setLocalBatchDeleteConfirm(true)}
+            onToggle={() => {}}
+            onSelectAll={handleLocalSelectAll}
+            onCancel={exitLocalMultiSelect}
+          />
+        )}
 
         {allLocalTags.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5">
@@ -859,6 +1026,7 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
             existsInWorkspace={existsInGlobal}
             onAddSkill={handlePresetAdd}
             onRemoveSkill={handlePresetRemove}
+            onBatchApply={handlePresetBatchApply}
             onComplete={handlePresetComplete}
           />
         )}
@@ -899,10 +1067,11 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
           {visibleLocalSkills.map((skill) => {
             const statusMeta = getLocalStatusMeta(t, skill.sync_status);
             const isManaged = !!skill.center_skill_id && managedLocalIds.has(skill.center_skill_id);
+            const key = `${skill.agent}:${skill.relative_path}`;
 
             return (
               <WorkspaceSkillCard
-                key={`${skill.agent}:${skill.relative_path}`}
+                key={key}
                 viewMode={viewMode}
                 title={skill.name}
                 description={skill.description || skill.relative_path}
@@ -912,7 +1081,12 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
                 active={isManaged}
                 actions={renderLocalSkillActions(skill, viewMode)}
                 actionsHover={viewMode === "list"}
-                onClick={() => void openLocalDetail(skill)}
+                selectable={isLocalMultiSelect}
+                selected={localSelectedIds.has(key)}
+                onToggleSelect={() => toggleLocalSelect(key)}
+                onClick={() =>
+                  isLocalMultiSelect ? toggleLocalSelect(key) : void openLocalDetail(skill)
+                }
               />
             );
           })}
@@ -1036,6 +1210,18 @@ export function WorkspaceView({ config }: { config: WorkspaceConfig }) {
         confirmLabel={t("common.delete")}
         onClose={() => setDeleteLocalConfirmSkill(null)}
         onConfirm={() => deleteLocalConfirmSkill ? handleDeleteLocalSkill(deleteLocalConfirmSkill) : Promise.resolve()}
+      />
+      <ConfirmDialog
+        open={localBatchDeleteConfirm}
+        title={t("globalWorkspace.localSkills.batchDeleteConfirmTitle")}
+        message={t("globalWorkspace.localSkills.batchDeleteConfirmMessage", {
+          count: localSelectedIds.size,
+          agent: currentTool?.display_name ?? "",
+        })}
+        tone="danger"
+        confirmLabel={t("common.delete")}
+        onClose={() => setLocalBatchDeleteConfirm(false)}
+        onConfirm={() => handleLocalBatchDelete()}
       />
     </div>
   );

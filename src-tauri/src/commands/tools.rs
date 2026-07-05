@@ -31,6 +31,10 @@ pub struct ToolInfoDto {
     pub project_relative_skills_dir: Option<String>,
     pub has_project_path_override: bool,
     pub category: ToolCategory,
+    /// Number of skill directories currently present on disk inside
+    /// `skills_dir`. Counted at query time so it stays in sync with the
+    /// filesystem instead of relying on potentially-stale DB records.
+    pub skill_count: usize,
 }
 
 /// Sync active scenario skills to a single tool.
@@ -58,6 +62,27 @@ fn reconcile_tool_sync_after_path_change(store: &SkillStore, tool_key: &str) {
 
 static GET_TOOL_STATUS_FIRST_CALL: AtomicBool = AtomicBool::new(true);
 
+/// Count the number of skill directories currently on disk inside `skills_dir`.
+/// Each immediate subdirectory that is itself a directory (or a symlink to one)
+/// counts as one skill. Returns 0 if the directory doesn't exist or can't be read.
+fn count_skill_dirs(skills_dir: &str) -> usize {
+    let path = std::path::Path::new(skills_dir);
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            if !p.is_dir() {
+                return false;
+            }
+            // Match is_valid_skill_dir: only count dirs that contain SKILL.md or skill.md
+            p.join("SKILL.md").is_file() || p.join("skill.md").is_file()
+        })
+        .count()
+}
+
 #[tauri::command]
 pub async fn get_tool_status(
     store: State<'_, Arc<SkillStore>>,
@@ -69,17 +94,21 @@ pub async fn get_tool_status(
         let count = infos.len();
         let result: Vec<ToolInfoDto> = infos
             .into_iter()
-            .map(|info: ToolInfo| ToolInfoDto {
-                key: info.key,
-                display_name: info.display_name,
-                installed: info.installed,
-                skills_dir: info.skills_dir,
-                enabled: info.enabled,
-                is_custom: info.is_custom,
-                has_path_override: info.has_path_override,
-                project_relative_skills_dir: info.project_relative_skills_dir,
-                has_project_path_override: info.has_project_path_override,
-                category: info.category,
+            .map(|info: ToolInfo| {
+                let skill_count = count_skill_dirs(&info.skills_dir);
+                ToolInfoDto {
+                    key: info.key,
+                    display_name: info.display_name,
+                    installed: info.installed,
+                    skills_dir: info.skills_dir,
+                    enabled: info.enabled,
+                    is_custom: info.is_custom,
+                    has_path_override: info.has_path_override,
+                    project_relative_skills_dir: info.project_relative_skills_dir,
+                    has_project_path_override: info.has_project_path_override,
+                    category: info.category,
+                    skill_count,
+                }
             })
             .collect();
         let elapsed_ms = start.elapsed().as_millis();

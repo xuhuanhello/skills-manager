@@ -1008,6 +1008,7 @@ pub fn run() {
             commands::presets::switch_preset,
             commands::presets::apply_preset_to_default,
             commands::presets::apply_preset_to_coding_agents,
+            commands::presets::batch_apply_skills,
             commands::presets::add_skill_to_preset,
             commands::presets::remove_skill_from_preset,
             commands::presets::reorder_presets,
