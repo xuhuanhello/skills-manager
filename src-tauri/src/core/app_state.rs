@@ -17,6 +17,10 @@ pub struct StartupTimings {
     pub migrate_legacy_tool_keys_ms: u128,
     pub skill_count: usize,
     pub reindex_from_metadata_ms: Option<u128>,
+    /// True when `reindex_from_metadata` failed and was skipped (existing DB
+    /// state kept). Surfaced via [`StartupTimings::log`] once the logger is up,
+    /// since anything logged during `initialize_store` is otherwise dropped.
+    pub reindex_failed: bool,
     pub restore_sync_included_ms: u128,
     pub restore_sync_included_changed: bool,
     pub write_all_from_db_ms: Option<u128>,
@@ -37,6 +41,7 @@ impl Default for StartupTimings {
             migrate_legacy_tool_keys_ms: 0,
             skill_count: 0,
             reindex_from_metadata_ms: None,
+            reindex_failed: false,
             restore_sync_included_ms: 0,
             restore_sync_included_changed: false,
             write_all_from_db_ms: None,
@@ -80,9 +85,25 @@ fn initialize_store_inner(
 
     if sync_metadata::metadata_exists() {
         let step = Instant::now();
-        sync_metadata::reindex_from_metadata(&store)
-            .context("Failed to reindex from sync metadata")?;
-        timings.reindex_from_metadata_ms = Some(step.elapsed().as_millis());
+        // Reindexing reconciles the on-disk metadata snapshot with the DB. It
+        // can legitimately fail when the snapshot is inconsistent with the
+        // skills directory — a state this app's own multi-machine git sync can
+        // produce (e.g. an interrupted pull). Treat that as non-fatal: log it
+        // and keep the existing DB state rather than aborting startup, which
+        // previously turned a recoverable inconsistency into an unopenable app
+        // (the process panicked before any window or error dialog existed).
+        match sync_metadata::reindex_from_metadata(&store) {
+            Ok(()) => {
+                timings.reindex_from_metadata_ms = Some(step.elapsed().as_millis());
+            }
+            Err(e) => {
+                timings.reindex_from_metadata_ms = Some(step.elapsed().as_millis());
+                timings.reindex_failed = true;
+                log::warn!(
+                    "Startup reindex_from_metadata failed, keeping existing DB state: {e:#}"
+                );
+            }
+        }
     }
 
     let step = Instant::now();
@@ -134,11 +155,18 @@ impl StartupTimings {
             self.migrate_legacy_tool_keys_ms
         );
         if let Some(ms) = self.reindex_from_metadata_ms {
-            log::info!(
-                "startup: reindex_from_metadata {} ms (skills={})",
-                ms,
-                self.skill_count
-            );
+            if self.reindex_failed {
+                log::warn!(
+                    "startup: reindex_from_metadata FAILED after {} ms — kept existing DB state (see earlier warning for cause)",
+                    ms
+                );
+            } else {
+                log::info!(
+                    "startup: reindex_from_metadata {} ms (skills={})",
+                    ms,
+                    self.skill_count
+                );
+            }
         }
         if self.restore_sync_included_changed {
             log::info!(
