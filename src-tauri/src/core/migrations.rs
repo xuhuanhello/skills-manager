@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 /// Current schema version. Bump this when adding a new migration.
-const LATEST_VERSION: u32 = 6;
+const LATEST_VERSION: u32 = 7;
 
 /// Run all pending migrations on the database.
 ///
@@ -10,7 +10,11 @@ const LATEST_VERSION: u32 = 6;
 /// - Existing databases (user_version == 0): runs incremental migrations
 ///   to bring them up to date.
 /// - Databases newer than this app version: returns an error.
-pub fn run_migrations(conn: &Connection) -> Result<()> {
+///
+/// Returns the schema version the database was at *before* this call, so
+/// startup code can react to specific upgrades (e.g. flush the v7 toggle
+/// reconciliation into the metadata JSON before the startup reindex).
+pub fn run_migrations(conn: &Connection) -> Result<u32> {
     let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
     if current > LATEST_VERSION {
@@ -21,7 +25,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     if current == LATEST_VERSION {
-        return Ok(());
+        return Ok(current);
     }
 
     // Run each migration step in a transaction
@@ -41,7 +45,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(current)
 }
 
 /// Execute a single migration step: version N → N+1.
@@ -53,6 +57,7 @@ fn migrate_step(conn: &Connection, from_version: u32) -> Result<()> {
         3 => migrate_v3_to_v4(conn),
         4 => migrate_v4_to_v5(conn),
         5 => migrate_v5_to_v6(conn),
+        6 => migrate_v6_to_v7(conn),
         _ => bail!("unknown migration version: {from_version}"),
     }
 }
@@ -275,6 +280,44 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6 → v7: Reconcile `scenario_skill_tools` (per-scenario "intent" toggles)
+/// with `skill_targets` (the actual on-disk sync records).
+///
+/// A prior bug had the batch-sync and single-sync/unsync paths only update the
+/// *active* scenario's toggle when the global `skill_targets` table changed.
+/// Because `skill_targets` is shared across all scenarios, toggles in
+/// non-active presets went stale: they kept `enabled = 1` for `(skill, tool)`
+/// pairs that were no longer synced on disk, making a preset's detail panel
+/// show a tool as enabled even though nothing was written to its skills
+/// directory (the "UI says enabled but not actually synced" bug).
+///
+/// Scope: only the **active** scenario is reconciled. `skill_targets` mirrors
+/// the active scenario's on-disk state, so an enabled toggle without a target
+/// row is provably stale there. In a non-active scenario the same combination
+/// is legitimate future intent ("sync this when the preset is activated") and
+/// must not be cleared.
+///
+/// This is a one-shot reconciliation. After it, the patched sync/apply code
+/// keeps the two tables consistent going forward by mirroring every global
+/// target change into all of the skill's scenarios.
+fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE scenario_skill_tools
+         SET enabled = 0
+         WHERE enabled = 1
+           AND scenario_id IN (
+             SELECT scenario_id FROM active_scenario WHERE key = 'current'
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM skill_targets t
+             WHERE t.skill_id = scenario_skill_tools.skill_id
+               AND t.tool = scenario_skill_tools.tool
+           )",
+        [],
+    )?;
+    Ok(())
+}
+
 // ── Helpers ──
 
 fn add_column_if_missing(
@@ -467,6 +510,10 @@ mod tests {
                 last_error TEXT,
                 UNIQUE(skill_id, tool)
             );
+            CREATE TABLE active_scenario (
+                key TEXT PRIMARY KEY DEFAULT 'current',
+                scenario_id TEXT REFERENCES scenarios(id) ON DELETE SET NULL
+            );
             PRAGMA user_version = 1;
             ",
         )
@@ -494,5 +541,99 @@ mod tests {
             msg.contains("newer than this app supports"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn test_run_migrations_reports_previous_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert_eq!(run_migrations(&conn).unwrap(), 0);
+        // Already at latest: reports the current (latest) version.
+        assert_eq!(run_migrations(&conn).unwrap(), LATEST_VERSION);
+    }
+
+    /// v6→v7 must only clear stale toggles (enabled without a matching
+    /// `skill_targets` row) in the **active** scenario. The same combination
+    /// in a non-active scenario is legitimate intent for the next activation
+    /// and must survive the migration.
+    #[test]
+    fn test_v6_to_v7_clears_stale_toggles_only_in_active_scenario() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+
+        // Minimal v6 fixture: just the tables the v7 step touches, in their
+        // v6 shapes, plus the FK parents.
+        conn.execute_batch(
+            "
+            CREATE TABLE skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                central_path TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE scenarios (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE scenario_skill_tools (
+                scenario_id TEXT NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+                skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+                tool TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(scenario_id, skill_id, tool)
+            );
+            CREATE TABLE skill_targets (
+                id TEXT PRIMARY KEY,
+                skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+                tool TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT DEFAULT 'ok',
+                synced_at INTEGER,
+                last_error TEXT,
+                source_hash TEXT,
+                UNIQUE(skill_id, tool)
+            );
+            CREATE TABLE active_scenario (
+                key TEXT PRIMARY KEY DEFAULT 'current',
+                scenario_id TEXT REFERENCES scenarios(id) ON DELETE SET NULL
+            );
+
+            INSERT INTO skills VALUES ('s1', 'skill-1', 'import', '/central/skill-1');
+            INSERT INTO scenarios VALUES ('A', 'Active'), ('B', 'Standby');
+            INSERT INTO active_scenario VALUES ('current', 'A');
+            INSERT INTO skill_targets VALUES
+                ('t1', 's1', 'tool_with_target', '/agent/skill-1', 'copy', 'ok', 1, NULL, NULL);
+            INSERT INTO scenario_skill_tools VALUES
+                ('A', 's1', 'tool_with_target', 1, 1),  -- active, synced: keep
+                ('A', 's1', 'tool_stale',       1, 1),  -- active, no target: clear
+                ('B', 's1', 'tool_stale',       1, 1),  -- non-active intent: keep
+                ('A', 's1', 'tool_off',         0, 1);  -- already off: keep off
+            PRAGMA user_version = 6;
+            ",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let enabled = |scenario: &str, tool: &str| -> i64 {
+            conn.query_row(
+                "SELECT enabled FROM scenario_skill_tools
+                 WHERE scenario_id = ?1 AND skill_id = 's1' AND tool = ?2",
+                [scenario, tool],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(enabled("A", "tool_with_target"), 1, "synced pair must stay enabled");
+        assert_eq!(enabled("A", "tool_stale"), 0, "stale active-scenario toggle must be cleared");
+        assert_eq!(enabled("B", "tool_stale"), 1, "non-active scenario intent must be preserved");
+        assert_eq!(enabled("A", "tool_off"), 0, "disabled toggle stays disabled");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_VERSION);
     }
 }

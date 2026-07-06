@@ -16,6 +16,13 @@ pub struct StartupTimings {
     pub open_store_ms: u128,
     pub migrate_legacy_tool_keys_ms: u128,
     pub skill_count: usize,
+    /// Time spent flushing the freshly migrated DB into the metadata JSON
+    /// (one-shot after the v7 upgrade), `None` when the flush didn't run.
+    pub post_v7_flush_ms: Option<u128>,
+    /// True when the post-v7 flush ran and failed (non-fatal: the reindex
+    /// then restores pre-v7 toggles and the reconciliation is lost until
+    /// the next toggle write, but startup continues).
+    pub post_v7_flush_failed: bool,
     pub reindex_from_metadata_ms: Option<u128>,
     /// True when `reindex_from_metadata` failed and was skipped (existing DB
     /// state kept). Surfaced via [`StartupTimings::log`] once the logger is up,
@@ -40,6 +47,8 @@ impl Default for StartupTimings {
             open_store_ms: 0,
             migrate_legacy_tool_keys_ms: 0,
             skill_count: 0,
+            post_v7_flush_ms: None,
+            post_v7_flush_failed: false,
             reindex_from_metadata_ms: None,
             reindex_failed: false,
             restore_sync_included_ms: 0,
@@ -84,6 +93,24 @@ fn initialize_store_inner(
     timings.skill_count = store.get_all_skills().map(|s| s.len()).unwrap_or(0);
 
     if sync_metadata::metadata_exists() {
+        // One-shot after the v6→v7 upgrade of an existing database: the
+        // migration just cleared stale toggles in `scenario_skill_tools`, but
+        // the membership JSON still carries the pre-migration values, and the
+        // reindex below would write them straight back into the DB. Flush
+        // DB→JSON first so the reindex reads back the reconciled state
+        // (idempotent). Failure is non-fatal — the reconciliation is undone
+        // by the reindex, which is the pre-migration status quo, not a crash.
+        if store.upgraded_existing_db_to_v7() {
+            let step = Instant::now();
+            if let Err(e) = sync_metadata::write_all_from_db(&store) {
+                timings.post_v7_flush_failed = true;
+                log::warn!(
+                    "Post-v7 metadata flush failed; startup reindex may restore pre-v7 toggles: {e:#}"
+                );
+            }
+            timings.post_v7_flush_ms = Some(step.elapsed().as_millis());
+        }
+
         let step = Instant::now();
         // Reindexing reconciles the on-disk metadata snapshot with the DB. It
         // can legitimately fail when the snapshot is inconsistent with the
@@ -154,6 +181,16 @@ impl StartupTimings {
             self.open_store_ms,
             self.migrate_legacy_tool_keys_ms
         );
+        if let Some(ms) = self.post_v7_flush_ms {
+            if self.post_v7_flush_failed {
+                log::warn!(
+                    "startup: post-v7 metadata flush FAILED after {} ms (see earlier warning for cause)",
+                    ms
+                );
+            } else {
+                log::info!("startup: post-v7 metadata flush {} ms", ms);
+            }
+        }
         if let Some(ms) = self.reindex_from_metadata_ms {
             if self.reindex_failed {
                 log::warn!(

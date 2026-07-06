@@ -13,6 +13,14 @@ const SENSITIVE_KEYS: &[&str] = &["proxy_url", "git_backup_remote_url"];
 pub struct SkillStore {
     conn: Mutex<Connection>,
     secret_key: [u8; 32],
+    /// Set when opening upgraded a *pre-existing* database across the v7
+    /// toggle-reconciliation migration. Startup uses this one-shot flag to
+    /// flush the migrated DB into the metadata JSON before the reindex would
+    /// otherwise restore the stale pre-v7 toggles from disk. Deliberately
+    /// false for brand-new database files: those may coexist with an already
+    /// populated metadata snapshot (fresh machine, re-cloned central repo),
+    /// and flushing an empty DB over it would erase the snapshot.
+    upgraded_existing_db_to_v7: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +110,9 @@ pub struct ScenarioSkillToolToggleRecord {
 
 impl SkillStore {
     pub fn new(db_path: &PathBuf) -> Result<Self> {
+        // Captured before Connection::open creates the file: distinguishes an
+        // existing install being upgraded from a brand-new (empty) database.
+        let db_existed = db_path.exists();
         let conn = Connection::open(db_path)?;
         // busy_timeout makes concurrent CLI + GUI writers wait briefly instead
         // of failing immediately with SQLITE_BUSY. 5s is generous for any
@@ -109,7 +120,11 @@ impl SkillStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
-        super::migrations::run_migrations(&conn)?;
+        let version_before = super::migrations::run_migrations(&conn)?;
+        // `version_before >= 1` additionally excludes a zero-byte file left by
+        // a run that crashed before its first migration committed — like a
+        // fresh DB, flushing it over the metadata JSON would wipe the snapshot.
+        let upgraded_existing_db_to_v7 = db_existed && (1..7).contains(&version_before);
 
         // Derive key file path from the database directory.
         let key_path = db_path
@@ -121,7 +136,15 @@ impl SkillStore {
         Ok(Self {
             conn: Mutex::new(conn),
             secret_key,
+            upgraded_existing_db_to_v7,
         })
+    }
+
+    /// One-shot signal for startup: this open migrated an existing database
+    /// from a pre-v7 schema, so the v7 toggle reconciliation needs to be
+    /// flushed into the metadata JSON before the startup reindex runs.
+    pub fn upgraded_existing_db_to_v7(&self) -> bool {
+        self.upgraded_existing_db_to_v7
     }
 
     // ── Skills CRUD ──
