@@ -763,11 +763,51 @@ pub fn quit_app(app: &tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Handle an unrecoverable failure in `initialize_store` without panicking:
+/// write a diagnostic file with remediation guidance next to the app's other
+/// logs, echo it to stderr, and exit cleanly. This replaces a bare `.expect()`
+/// that crashed the process before any panic hook or error UI existed, leaving
+/// users with a window-less app and no clue why.
+///
+/// A native error dialog would be friendlier still, but showing one before the
+/// Tauri runtime is up needs an extra dependency; that refinement is tracked
+/// separately. The diagnostic file + non-zero exit already remove the silent
+/// crash and give a recovery path.
+fn fatal_startup_error(log_dir: &std::path::Path, err: &anyhow::Error) -> ! {
+    let _ = std::fs::create_dir_all(log_dir);
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+    let body = format!(
+        "[{timestamp}] Skills Manager failed to start.\n\n\
+         Error: {err:#}\n\n\
+         The app could not initialize its local database or skills index. Your \
+         skill files have not been modified. Common causes and fixes:\n\
+         - Corrupt local database: move aside '{db}' and restart.\n\
+         - An interrupted git sync left the skills index inconsistent: move aside \
+         the '.skills-manager' metadata folder under your skills directory and restart.\n\
+         - Disk full or a permissions problem on the data folder.\n",
+        db = core::central_repo::db_path().display(),
+    );
+    let path = log_dir.join("startup_error.log");
+    let _ = std::fs::write(&path, &body);
+    eprintln!("{body}\nDiagnostic written to: {}", path.display());
+    std::process::exit(1);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let pre_builder_start = Instant::now();
-    let (store, startup_timings) =
-        core::app_state::initialize_store().expect("Failed to initialize app state");
+
+    // Install a panic hook and resolve a crash-log location BEFORE any startup
+    // work runs. A failure inside initialize_store() used to hit `.expect(...)`
+    // and panic before the panic hook or log plugin existed (installed later in
+    // `setup`), so the app just vanished with no window and no diagnostics.
+    let early_log_dir = core::central_repo::logs_dir();
+    core::panic_log::install_early_panic_hook(early_log_dir.clone());
+
+    let (store, startup_timings) = match core::app_state::initialize_store() {
+        Ok(v) => v,
+        Err(e) => fatal_startup_error(&early_log_dir, &e),
+    };
     let pre_builder_ms = pre_builder_start.elapsed().as_millis();
     let store_for_setup = store.clone();
 
