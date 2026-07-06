@@ -225,3 +225,172 @@ impl StartupTimings {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::central_repo;
+    use crate::core::skill_store::{ScenarioRecord, SkillRecord};
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    /// Build a populated store + metadata snapshot inside the overridden
+    /// central repo: one skill on disk, scenarios A (active) + B both
+    /// containing it, and an enabled `tool_x` toggle in each — with **no**
+    /// `skill_targets` row, i.e. the stale state the v7 migration reconciles.
+    fn seed_repo_with_stale_toggles(base: &Path) -> String {
+        fs::create_dir_all(central_repo::skills_dir()).unwrap();
+        let store = crate::core::skill_store::SkillStore::new(&base.join("skills-manager.db"))
+            .unwrap();
+
+        let source = central_repo::skills_dir().join("skill-1");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "---\nname: skill-1\n---\n").unwrap();
+        store
+            .insert_skill(&SkillRecord {
+                id: "skill-1".to_string(),
+                name: "skill-1".to_string(),
+                description: None,
+                source_type: "import".to_string(),
+                source_ref: Some(source.to_string_lossy().to_string()),
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: source.to_string_lossy().to_string(),
+                content_hash: None,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+
+        for id in ["A", "B"] {
+            store
+                .insert_scenario(&ScenarioRecord {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: None,
+                    icon: None,
+                    sort_order: 0,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+            store.add_skill_to_scenario(id, "skill-1").unwrap();
+            store
+                .set_scenario_skill_tool_enabled(id, "skill-1", "tool_x", true)
+                .unwrap();
+        }
+        store.set_active_scenario("A").unwrap();
+
+        // Persist the pre-migration state into the metadata JSON, exactly as
+        // a pre-v7 build would have left it on disk.
+        sync_metadata::write_all_from_db(&store).unwrap();
+        "skill-1".to_string()
+    }
+
+    fn membership_tool_x(scenario: &str) -> bool {
+        let path = sync_metadata::metadata_dir()
+            .join("scenario-skills")
+            .join(scenario)
+            .join("skill-1.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["tools"]["tool_x"].as_bool().unwrap()
+    }
+
+    /// End-to-end replay of the v6→v7 upgrade on a populated repo: the
+    /// migration clears the active scenario's stale toggle, the one-shot
+    /// flush pushes that into the metadata JSON *before* reindex, and the
+    /// reindex reads back the reconciled state instead of restoring the
+    /// stale one. Non-active intent (scenario B) survives all three stages.
+    #[test]
+    fn startup_migration_flush_reindex_end_to_end() {
+        let _lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+
+        seed_repo_with_stale_toggles(&base);
+        // Both memberships carry the stale enabled=true snapshot.
+        assert!(membership_tool_x("A") && membership_tool_x("B"));
+
+        // Rewind the schema version so the next open replays v6→v7 as an
+        // existing-database upgrade (the store from seeding is closed here).
+        {
+            let conn = rusqlite::Connection::open(base.join("skills-manager.db")).unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let store = initialize_cli_store().expect("startup must succeed");
+
+        let enabled = |scenario: &str| {
+            store
+                .get_enabled_tools_for_scenario_skill(scenario, "skill-1")
+                .unwrap()
+                .contains(&"tool_x".to_string())
+        };
+        assert!(
+            !enabled("A"),
+            "active scenario's stale toggle must be cleared and stay cleared through reindex"
+        );
+        assert!(
+            enabled("B"),
+            "non-active scenario intent must survive migration + flush + reindex"
+        );
+        assert!(
+            !membership_tool_x("A"),
+            "flush must land the reconciled toggle in the metadata JSON before reindex"
+        );
+        assert!(membership_tool_x("B"));
+        assert_eq!(store.get_all_skills().unwrap().len(), 1, "reindex must keep the skill");
+
+        central_repo::set_test_base_dir_override(None);
+    }
+
+    /// New-machine guard: a fresh (absent) database next to a populated
+    /// metadata snapshot must NOT trigger the post-v7 flush — flushing an
+    /// empty DB would erase the snapshot. Instead the reindex imports the
+    /// snapshot, toggles included, into the new database.
+    #[test]
+    fn fresh_db_with_existing_snapshot_is_imported_not_wiped() {
+        let _lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+
+        seed_repo_with_stale_toggles(&base);
+
+        // Simulate the re-clone-on-a-new-machine state: metadata + skills on
+        // disk, no local database.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(base.join(format!("skills-manager.db{suffix}")));
+        }
+
+        let store = initialize_cli_store().expect("startup must succeed");
+
+        let skills = store.get_all_skills().unwrap();
+        assert_eq!(skills.len(), 1, "snapshot must be imported into the fresh DB");
+        assert_eq!(skills[0].id, "skill-1");
+        assert!(
+            membership_tool_x("A") && membership_tool_x("B"),
+            "metadata JSON must survive a fresh-DB startup untouched"
+        );
+        assert!(
+            store
+                .get_enabled_tools_for_scenario_skill("B", "skill-1")
+                .unwrap()
+                .contains(&"tool_x".to_string()),
+            "imported membership must carry the snapshot's toggles"
+        );
+
+        central_repo::set_test_base_dir_override(None);
+    }
+}
