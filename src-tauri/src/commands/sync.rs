@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
@@ -7,7 +6,7 @@ use crate::core::{
     repo_lock::RepoLock,
     scenario_service,
     skill_store::SkillStore,
-    sync_engine, sync_metadata, tool_adapters,
+    sync_metadata, tool_adapters,
     tool_service,
 };
 use serde::Serialize;
@@ -103,14 +102,22 @@ pub async fn unsync_skill_from_tool(
                 .get_targets_for_skill(&skill_id)
                 .map_err(AppError::db)?;
 
+            // A failed physical removal now surfaces as an error and keeps
+            // the target row (and toggles) in place, so the UI keeps showing
+            // the pair and the user can retry — instead of the old .ok()
+            // swallow that dropped the row and orphaned the files invisibly.
             if let Some(target) = targets.iter().find(|t| t.tool == tool) {
-                let target_path = PathBuf::from(&target.target_path);
-                sync_engine::remove_target(&target_path).ok();
+                scenario_service::unsync_pair(
+                    &store,
+                    &skill_id,
+                    &tool,
+                    std::path::Path::new(&target.target_path),
+                )?;
+            } else {
+                store
+                    .delete_target(&skill_id, &tool)
+                    .map_err(AppError::db)?;
             }
-
-            store
-                .delete_target(&skill_id, &tool)
-                .map_err(AppError::db)?;
 
             // An unsync fired from the global skill list removes a row from
             // the global `skill_targets`, so mirror it into every scenario the
@@ -273,13 +280,23 @@ pub async fn set_skill_tool_toggle(
                 let targets = store
                     .get_targets_for_skill(&skill_id)
                     .map_err(AppError::db)?;
+                // Same policy as unsync_skill_from_tool: a failed removal
+                // errors out and keeps the row, rather than silently
+                // orphaning the files. The toggle itself was already
+                // persisted above, so the UI reflects the user's intent
+                // while the on-disk state stays visible until retried.
                 if let Some(target) = targets.iter().find(|target| target.tool == tool) {
-                    // Safe because the app currently guarantees a single active scenario.
-                    sync_engine::remove_target(&PathBuf::from(&target.target_path)).ok();
+                    scenario_service::unsync_pair(
+                        &store,
+                        &skill_id,
+                        &tool,
+                        std::path::Path::new(&target.target_path),
+                    )?;
+                } else {
+                    store
+                        .delete_target(&skill_id, &tool)
+                        .map_err(AppError::db)?;
                 }
-                store
-                    .delete_target(&skill_id, &tool)
-                    .map_err(AppError::db)?;
             }
         }
 
@@ -296,8 +313,9 @@ pub async fn set_skill_tool_toggle(
 mod tests {
     use super::*;
     use crate::core::skill_store::SkillRecord;
-    use crate::core::tool_adapters::CustomToolDef;
+    use crate::core::tool_adapters::{self, CustomToolDef};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn sample_skill(id: &str, name: &str, central_path: &std::path::Path) -> SkillRecord {

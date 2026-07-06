@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{
@@ -144,6 +144,79 @@ fn skip_check_mode(existing_mode: &str, desired: sync_engine::SyncMode) -> Optio
     }
 }
 
+/// Sync one skill directory to one tool target and record the outcome as a
+/// `skill_targets` row — the single write path for the "(disk sync, DB row)"
+/// pair. Every caller that establishes a sync goes through here so the row
+/// shape (fresh UUID, `status: ok`, `synced_at: now`, recorded `source_hash`
+/// for the #153 freshness gate) can never drift between entry points.
+///
+/// Errors are returned, not logged: each caller owns its policy (skip and
+/// count, warn and continue, or propagate). `ErrorKind::Io` means the disk
+/// sync failed (nothing recorded); `ErrorKind::Database` means the disk sync
+/// succeeded but the row insert failed — the next startup pass detects the
+/// missing row and re-syncs, so both are safe to surface as "failed".
+///
+/// The hash-refresh partial update in `resync_copy_targets` intentionally
+/// does not use this: it preserves the existing row identity instead of
+/// minting a new one.
+pub(crate) fn sync_pair(
+    store: &SkillStore,
+    pair: &ScenarioSyncTarget,
+) -> Result<sync_engine::SyncMode, AppError> {
+    let actual_mode =
+        sync_engine::sync_skill(&pair.source, &pair.target, pair.mode).map_err(AppError::io)?;
+    let record = SkillTargetRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        skill_id: pair.skill_id.clone(),
+        tool: pair.tool.clone(),
+        target_path: pair.target.to_string_lossy().to_string(),
+        mode: actual_mode.as_str().to_string(),
+        status: "ok".to_string(),
+        synced_at: Some(chrono::Utc::now().timestamp_millis()),
+        last_error: None,
+        source_hash: pair.source_hash.clone(),
+    };
+    store.insert_target(&record).map_err(AppError::db)?;
+    Ok(actual_mode)
+}
+
+/// Tear down one (skill, tool) sync: remove the files, then drop the
+/// `skill_targets` row — the single write path mirroring [`sync_pair`].
+///
+/// Two invariants live here so no call site can get them wrong:
+///
+/// - **Removal first, row second.** When the disk removal fails the row is
+///   kept and the error returned, so the pair stays visible and retryable
+///   instead of silently leaving an orphaned directory behind (the same
+///   decision as batch remove).
+/// - **Shared paths survive.** Several tools can resolve to the same skills
+///   directory, so a physical path may back more than one row. The files are
+///   only removed when this pair owns the last row pointing at them;
+///   otherwise only the row is dropped.
+///
+/// Batch remove (`apply_remove`) implements the same rules inline because it
+/// evaluates shared-ness across the whole batch at once.
+pub(crate) fn unsync_pair(
+    store: &SkillStore,
+    skill_id: &str,
+    tool: &str,
+    target_path: &Path,
+) -> Result<(), AppError> {
+    let shared = store
+        .get_all_targets()
+        .map_err(AppError::db)?
+        .iter()
+        .any(|t| {
+            !(t.skill_id == skill_id && t.tool == tool)
+                && Path::new(&t.target_path) == target_path
+        });
+    if !shared {
+        sync_engine::remove_target(target_path).map_err(AppError::io)?;
+    }
+    store.delete_target(skill_id, tool).map_err(AppError::db)?;
+    Ok(())
+}
+
 pub fn sync_desired_targets(
     store: &SkillStore,
     desired_targets: &[ScenarioSyncTarget],
@@ -166,15 +239,14 @@ pub fn sync_desired_targets(
         if let Some(existing) = existing_targets.get(&key) {
             let target_path = PathBuf::from(&existing.target_path);
             if target_path != desired.target {
-                if let Err(e) = sync_engine::remove_target(&target_path) {
+                // Replace flow: even when the stale removal fails, the
+                // sync_pair below upserts the row onto the new path, so a
+                // warning (not an abort) is the right severity here.
+                if let Err(e) = unsync_pair(store, &desired.skill_id, &desired.tool, &target_path)
+                {
                     log::warn!(
-                        "Failed to remove stale target {}: {e}",
-                        target_path.display()
-                    );
-                }
-                if let Err(e) = store.delete_target(&desired.skill_id, &desired.tool) {
-                    log::warn!(
-                        "Failed to delete stale target record for skill {}, tool {}: {e}",
+                        "Failed to clean up stale target {} for skill {}, tool {}: {e}",
+                        target_path.display(),
                         desired.skill_id,
                         desired.tool
                     );
@@ -210,29 +282,8 @@ pub fn sync_desired_targets(
             }
         }
 
-        match sync_engine::sync_skill(&desired.source, &desired.target, desired.mode) {
+        match sync_pair(store, desired) {
             Ok(actual_mode) => {
-                let now = chrono::Utc::now().timestamp_millis();
-                let target_record = SkillTargetRecord {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    skill_id: desired.skill_id.clone(),
-                    tool: desired.tool.clone(),
-                    target_path: desired.target.to_string_lossy().to_string(),
-                    mode: actual_mode.as_str().to_string(),
-                    status: "ok".to_string(),
-                    synced_at: Some(now),
-                    last_error: None,
-                    // Record the hash that was just synced so the next
-                    // run of this loop can short-circuit when the central
-                    // skill content has not changed (issue #153).
-                    source_hash: desired.source_hash.clone(),
-                };
-                if let Err(e) = store.insert_target(&target_record) {
-                    log::warn!(
-                        "Failed to insert sync target for skill {}: {e}",
-                        desired.skill_id
-                    );
-                }
                 synced_count += 1;
                 let elapsed = target_start.elapsed().as_millis();
                 if elapsed >= 200 {
@@ -286,7 +337,18 @@ pub fn unsync_obsolete_scenario_targets(
         .get_skill_ids_for_scenario(old_scenario_id)
         .map_err(AppError::db)?;
     for skill_id in &old_skill_ids {
-        let targets = store.get_targets_for_skill(skill_id).unwrap_or_default();
+        // Cleanup loop policy: log and move to the next unit instead of
+        // aborting, so one broken skill doesn't leave every other target
+        // of the old scenario behind.
+        let targets = match store.get_targets_for_skill(skill_id) {
+            Ok(targets) => targets,
+            Err(e) => {
+                log::warn!(
+                    "unsync_obsolete_scenario_targets: failed to list targets for skill {skill_id}, skipping: {e}"
+                );
+                continue;
+            }
+        };
         for target in &targets {
             let path = PathBuf::from(&target.target_path);
             let key = (skill_id.clone(), target.tool.clone());
@@ -294,12 +356,10 @@ pub fn unsync_obsolete_scenario_targets(
                 continue;
             }
 
-            if let Err(e) = sync_engine::remove_target(&path) {
-                log::warn!("Failed to remove sync target {}: {e}", path.display());
-            }
-            if let Err(e) = store.delete_target(skill_id, &target.tool) {
+            if let Err(e) = unsync_pair(store, skill_id, &target.tool, &path) {
                 log::warn!(
-                    "Failed to delete target record for skill {skill_id}, tool {}: {e}",
+                    "Failed to unsync obsolete target {} for skill {skill_id}, tool {}: {e}",
+                    path.display(),
                     target.tool
                 );
             }
@@ -315,15 +375,23 @@ pub fn unsync_scenario_skills(store: &SkillStore, scenario_id: &str) -> Result<(
         .map_err(AppError::db)?;
 
     for skill_id in &skill_ids {
-        let targets = store.get_targets_for_skill(skill_id).unwrap_or_default();
+        // Same cleanup-loop policy as unsync_obsolete_scenario_targets:
+        // log and continue rather than abort the remaining skills.
+        let targets = match store.get_targets_for_skill(skill_id) {
+            Ok(targets) => targets,
+            Err(e) => {
+                log::warn!(
+                    "unsync_scenario_skills: failed to list targets for skill {skill_id}, skipping: {e}"
+                );
+                continue;
+            }
+        };
         for target in &targets {
             let path = PathBuf::from(&target.target_path);
-            if let Err(e) = sync_engine::remove_target(&path) {
-                log::warn!("Failed to remove sync target {}: {e}", path.display());
-            }
-            if let Err(e) = store.delete_target(skill_id, &target.tool) {
+            if let Err(e) = unsync_pair(store, skill_id, &target.tool, &path) {
                 log::warn!(
-                    "Failed to delete target record for skill {skill_id}, tool {}: {e}",
+                    "Failed to unsync target {} for skill {skill_id}, tool {}: {e}",
+                    path.display(),
                     target.tool
                 );
             }
@@ -342,7 +410,10 @@ pub fn apply_scenario_to_default(store: &SkillStore, scenario_id: &str) -> Resul
     ensure_scenario_exists(store, scenario_id)?;
     let desired_targets = collect_scenario_sync_targets(store, scenario_id)?;
 
-    if let Ok(Some(old_id)) = store.get_active_scenario_id() {
+    // A failed read here must abort: proceeding without knowing the old
+    // scenario would skip the obsolete-target cleanup and leave the previous
+    // scenario's files on disk with live-looking DB rows.
+    if let Some(old_id) = store.get_active_scenario_id().map_err(AppError::db)? {
         if old_id != scenario_id {
             unsync_obsolete_scenario_targets(store, &old_id, &desired_targets)?;
         }
@@ -357,53 +428,53 @@ pub fn sync_skill_to_active_scenario(
     scenario_id: &str,
     skill_id: &str,
 ) -> Result<(), AppError> {
-    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
+    if let Some(active_id) = store.get_active_scenario_id().map_err(AppError::db)? {
         if active_id == scenario_id {
             let adapters = enabled_installed_adapters_for_scenario_skill(store, scenario_id, skill_id)?;
             let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
-            let Ok(Some(skill)) = store.get_skill_by_id(skill_id) else {
+            let Some(skill) = store.get_skill_by_id(skill_id).map_err(AppError::db)? else {
+                log::debug!(
+                    "sync_skill_to_active_scenario: skill {skill_id} no longer exists, nothing to sync"
+                );
                 return Ok(());
             };
             let source = PathBuf::from(&skill.central_path);
             let target_name = sync_engine::target_dir_name(&source, &skill.name);
-            let old_targets = store.get_targets_for_skill(skill_id).unwrap_or_default();
+            let old_targets = store.get_targets_for_skill(skill_id).unwrap_or_else(|e| {
+                log::warn!(
+                    "sync_skill_to_active_scenario: failed to list existing targets for skill {skill_id}, skipping stale-path cleanup: {e}"
+                );
+                Vec::new()
+            });
             for adapter in &adapters {
                 if let Some(old) = old_targets.iter().find(|t| t.tool == adapter.key) {
                     let old_path = PathBuf::from(&old.target_path);
                     if old_path != adapter.skills_dir().join(&target_name) {
-                        if let Err(e) = sync_engine::remove_target(&old_path) {
-                            log::warn!("Failed to remove stale target {}: {e}", old_path.display());
+                        // Replace flow: the sync_pair below re-upserts the row,
+                        // so a failed stale cleanup is a warning, not an abort.
+                        if let Err(e) = unsync_pair(store, skill_id, &adapter.key, &old_path) {
+                            log::warn!(
+                                "Failed to clean up stale target {}: {e}",
+                                old_path.display()
+                            );
                         }
-                        let _ = store.delete_target(skill_id, &adapter.key);
                     }
                 }
 
-                let target = adapter.skills_dir().join(&target_name);
-                let mode = sync_engine::sync_mode_for_tool(&adapter.key, configured_mode.as_deref());
-                match sync_engine::sync_skill(&source, &target, mode) {
-                    Ok(actual_mode) => {
-                        let now = chrono::Utc::now().timestamp_millis();
-                        let target_record = super::skill_store::SkillTargetRecord {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            skill_id: skill_id.to_string(),
-                            tool: adapter.key.clone(),
-                            target_path: target.to_string_lossy().to_string(),
-                            mode: actual_mode.as_str().to_string(),
-                            status: "ok".to_string(),
-                            synced_at: Some(now),
-                            last_error: None,
-                            source_hash: skill.content_hash.clone(),
-                        };
-                        if let Err(e) = store.insert_target(&target_record) {
-                            log::warn!("Failed to insert sync target for skill {skill_id}: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to sync skill {skill_id} to {}: {e}",
-                            target.display()
-                        );
-                    }
+                let pair = ScenarioSyncTarget {
+                    skill_id: skill_id.to_string(),
+                    skill_name: skill.name.clone(),
+                    tool: adapter.key.clone(),
+                    source: source.clone(),
+                    target: adapter.skills_dir().join(&target_name),
+                    mode: sync_engine::sync_mode_for_tool(&adapter.key, configured_mode.as_deref()),
+                    source_hash: skill.content_hash.clone(),
+                };
+                if let Err(e) = sync_pair(store, &pair) {
+                    log::warn!(
+                        "Failed to sync skill {skill_id} to {}: {e}",
+                        pair.target.display()
+                    );
                 }
             }
         }
@@ -500,17 +571,41 @@ pub fn restore_all_skills_sync_included(store: &SkillStore) -> Result<bool, AppE
     Ok(changed)
 }
 
+/// Fire-and-forget by design (called from tool-detection callbacks with no
+/// error channel), so every failure is logged rather than silently dropped.
 pub fn sync_active_scenario_to_tool(store: &SkillStore, tool_key: &str) {
-    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
-        let Ok(skill_ids) = store.get_skill_ids_for_scenario(&active_id) else {
+    let active_id = match store.get_active_scenario_id() {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            log::warn!("sync_active_scenario_to_tool: failed to read active scenario: {e}");
             return;
-        };
-        for skill_id in skill_ids {
-            if let Ok(adapters) = enabled_installed_adapters_for_scenario_skill(store, &active_id, &skill_id)
-            {
+        }
+    };
+    let skill_ids = match store.get_skill_ids_for_scenario(&active_id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            log::warn!(
+                "sync_active_scenario_to_tool: failed to list skills for scenario {active_id}: {e}"
+            );
+            return;
+        }
+    };
+    for skill_id in skill_ids {
+        match enabled_installed_adapters_for_scenario_skill(store, &active_id, &skill_id) {
+            Ok(adapters) => {
                 if adapters.iter().any(|adapter| adapter.key == tool_key) {
-                    let _ = sync_skill_to_active_scenario(store, &active_id, &skill_id);
+                    if let Err(e) = sync_skill_to_active_scenario(store, &active_id, &skill_id) {
+                        log::warn!(
+                            "sync_active_scenario_to_tool: failed to sync skill {skill_id} to {tool_key}: {e}"
+                        );
+                    }
                 }
+            }
+            Err(e) => {
+                log::warn!(
+                    "sync_active_scenario_to_tool: failed to resolve adapters for skill {skill_id}: {e}"
+                );
             }
         }
     }
@@ -548,23 +643,16 @@ pub fn sync_single_skill_to_tool(
         .skills_dir()
         .join(sync_engine::target_dir_name(&source, &skill.name));
     let configured_mode = store.get_setting("sync_mode").map_err(AppError::db)?;
-    let mode = sync_engine::sync_mode_for_tool(tool, configured_mode.as_deref());
-    let actual_mode = sync_engine::sync_skill(&source, &target, mode).map_err(AppError::io)?;
-
-    let now = chrono::Utc::now().timestamp_millis();
-    let target_record = SkillTargetRecord {
-        id: uuid::Uuid::new_v4().to_string(),
+    let pair = ScenarioSyncTarget {
         skill_id: skill_id.to_string(),
+        skill_name: skill.name.clone(),
         tool: tool.to_string(),
-        target_path: target.to_string_lossy().to_string(),
-        mode: actual_mode.as_str().to_string(),
-        status: "ok".to_string(),
-        synced_at: Some(now),
-        last_error: None,
+        source,
+        target,
+        mode: sync_engine::sync_mode_for_tool(tool, configured_mode.as_deref()),
         source_hash: skill.content_hash.clone(),
     };
-
-    store.insert_target(&target_record).map_err(AppError::db)?;
+    sync_pair(store, &pair)?;
     Ok(())
 }
 
@@ -717,38 +805,26 @@ fn apply_add(
         let source = PathBuf::from(&skill.central_path);
         let target_name = sync_engine::target_dir_name(&source, &skill.name);
         for (tool_key, adapter) in &adapters {
-            let target = adapter.skills_dir().join(&target_name);
-            let mode = sync_engine::sync_mode_for_tool(tool_key, configured_mode.as_deref());
-            match sync_engine::sync_skill(&source, &target, mode) {
-                Ok(actual_mode) => {
-                    let now = chrono::Utc::now().timestamp_millis();
-                    let target_record = SkillTargetRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        skill_id: skill_id.clone(),
-                        tool: tool_key.clone(),
-                        target_path: target.to_string_lossy().to_string(),
-                        mode: actual_mode.as_str().to_string(),
-                        status: "ok".to_string(),
-                        synced_at: Some(now),
-                        last_error: None,
-                        source_hash: skill.content_hash.clone(),
-                    };
-                    if let Err(e) = store.insert_target(&target_record) {
-                        log::warn!(
-                            "apply_skills_to_tools: failed to insert target for skill {skill_id} / {tool_key}: {e}"
-                        );
-                        failed += 1;
-                    } else {
-                        applied += 1;
-                        synced_ok.insert((skill_id.clone(), tool_key.clone()));
-                    }
+            let pair = ScenarioSyncTarget {
+                skill_id: skill_id.clone(),
+                skill_name: skill.name.clone(),
+                tool: tool_key.clone(),
+                source: source.clone(),
+                target: adapter.skills_dir().join(&target_name),
+                mode: sync_engine::sync_mode_for_tool(tool_key, configured_mode.as_deref()),
+                source_hash: skill.content_hash.clone(),
+            };
+            match sync_pair(store, &pair) {
+                Ok(_) => {
+                    applied += 1;
+                    synced_ok.insert((skill_id.clone(), tool_key.clone()));
                 }
                 Err(e) => {
                     failed += 1;
                     log::warn!(
                         "apply_skills_to_tools: failed to sync skill {skill_id} ({}) to {}: {e}",
                         skill.name,
-                        target.display()
+                        pair.target.display()
                     );
                 }
             }
@@ -782,7 +858,9 @@ fn apply_remove(
 
     let mut to_delete: Vec<(String, String, PathBuf)> = Vec::new();
     for skill_id in skill_ids {
-        let targets = store.get_targets_for_skill(skill_id).unwrap_or_default();
+        // Abort, don't default to empty: this runs before any mutation, and a
+        // silently skipped skill would report success while removing nothing.
+        let targets = store.get_targets_for_skill(skill_id).map_err(AppError::db)?;
         for target in targets {
             if tool_set.contains(&target.tool) {
                 to_delete.push((
@@ -806,9 +884,11 @@ fn apply_remove(
         .iter()
         .map(|(skill_id, tool, _)| (skill_id.clone(), tool.clone()))
         .collect();
+    // Abort on a failed read: defaulting to an empty set would classify every
+    // path as unshared and physically delete directories other tools still use.
     let shared_paths: HashSet<PathBuf> = store
         .get_all_targets()
-        .unwrap_or_default()
+        .map_err(AppError::db)?
         .into_iter()
         .filter(|t| !batch_pairs.contains(&(t.skill_id.clone(), t.tool.clone())))
         .map(|t| PathBuf::from(&t.target_path))
