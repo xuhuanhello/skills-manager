@@ -5,8 +5,9 @@ use std::time::Instant;
 
 use super::{
     error::AppError,
+    repo_lock::RepoLock,
     skill_store::{ScenarioRecord, SkillStore, SkillTargetRecord},
-    sync_engine, tool_adapters,
+    sync_engine, sync_metadata, tool_adapters,
     tool_service,
 };
 
@@ -583,13 +584,62 @@ pub struct BatchApplyResult {
     pub failed: usize,
 }
 
-/// Apply a batch of `(skill_id × tool_key)` pairs in either Add or Remove mode
-/// without touching `active_scenario_id` or `scenario_skill_tools` toggles.
+/// Propagate a change in a skill's *actual* sync state (`skill_targets`) to
+/// the per-scenario toggle table (`scenario_skill_tools`) for **every**
+/// scenario the skill belongs to.
 ///
-/// This is the tray-side preset apply primitive. Unlike [`sync_single_skill_to_tool`]
-/// (which is wrapped by the `sync_skill_to_tool` Tauri command and carries the
-/// implicit active-preset toggle side-effect), this batch is a pure
-/// "write/remove files + maintain `skill_targets` rows" operation.
+/// `skill_targets` is global: a single row means "this skill is currently
+/// synced to this tool on disk". `scenario_skill_tools` is per-scenario
+/// intent ("when this preset is active, sync the skill to this tool").
+/// Whenever a *global* operation (batch apply, or a single sync/unsync from
+/// the skill list) adds or removes a target, the toggle must be updated in
+/// **every** scenario that contains the skill — not only the active one.
+/// Otherwise the detail panel of a non-active preset shows a stale
+/// "enabled" for a tool that is no longer (or not yet) actually synced,
+/// which is exactly the "UI says enabled but nothing on disk" bug.
+pub(crate) fn propagate_target_toggle(
+    store: &SkillStore,
+    skill_id: &str,
+    tool: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let all_adapter_keys: Vec<String> = tool_adapters::enabled_installed_adapters(store)
+        .iter()
+        .map(|a| a.key.clone())
+        .collect();
+    let scenario_ids = store.get_scenarios_for_skill(skill_id).map_err(|e| {
+        AppError::db(format!(
+            "propagate_target_toggle: failed to list scenarios for skill {skill_id}: {e}"
+        ))
+    })?;
+    for scenario_id in scenario_ids {
+        store
+            .ensure_scenario_skill_tool_defaults(&scenario_id, skill_id, &all_adapter_keys)
+            .map_err(|e| {
+                AppError::db(format!(
+                    "propagate_target_toggle: failed to seed tool defaults for scenario {scenario_id}, skill {skill_id}: {e}"
+                ))
+            })?;
+        store
+            .set_scenario_skill_tool_enabled(&scenario_id, skill_id, tool, enabled)
+            .map_err(|e| {
+                AppError::db(format!(
+                    "propagate_target_toggle: failed to set toggle {enabled} for scenario {scenario_id}, skill {skill_id}, tool {tool}: {e}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+/// Apply a batch of `(skill_id × tool_key)` pairs in either Add or Remove
+/// mode.
+///
+/// This is the tray-side preset apply primitive and the MySkills batch-sync
+/// primitive. Unlike [`sync_single_skill_to_tool`] (wrapped by the
+/// `sync_skill_to_tool` Tauri command) it does not touch `active_scenario_id`,
+/// but it does mirror each on-disk change into the `scenario_skill_tools`
+/// toggles of every affected scenario via [`propagate_target_toggle`] so the
+/// detail panels never go stale.
 ///
 /// Remove mode handles shared physical paths: a `target_path` may be referenced
 /// by multiple `(skill_id, tool)` records when several tools resolve to the same
@@ -606,10 +656,23 @@ pub fn apply_skills_to_tools(
         return Ok(BatchApplyResult::default());
     }
 
-    match mode {
+    // All three entry points (batch_apply_skills, apply_preset_to_coding_agents,
+    // tray preset click) funnel through here, so the central-repo lock and the
+    // DB→metadata flush live here rather than at each call site. The lock
+    // serializes with set_skill_tool_toggle and background repo writers; the
+    // flush keeps the membership JSON's `tools` map in step with the
+    // `scenario_skill_tools` rows this batch just updated — otherwise the next
+    // startup reindex would restore the pre-batch toggles from stale JSON.
+    // Callers must not already hold the repo lock (it is not reentrant).
+    let _lock = RepoLock::acquire_foreground("batch apply skills").map_err(AppError::db)?;
+
+    let result = match mode {
         BatchApplyMode::Add => apply_add(store, skill_ids, tool_keys),
         BatchApplyMode::Remove => apply_remove(store, skill_ids, tool_keys),
-    }
+    }?;
+
+    sync_metadata::write_all_from_db_unlocked(store).map_err(AppError::db)?;
+    Ok(result)
 }
 
 fn apply_add(
@@ -642,6 +705,10 @@ fn apply_add(
 
     let mut applied = 0usize;
     let mut failed = 0usize;
+    // Only pairs whose sync + insert_target both succeeded may have their
+    // scenario toggles flipped to enabled below; propagating for a failed
+    // pair would recreate the "UI says enabled but nothing on disk" split.
+    let mut synced_ok: HashSet<(String, String)> = HashSet::new();
     for skill_id in skill_ids {
         let Ok(Some(skill)) = store.get_skill_by_id(skill_id) else {
             log::warn!("apply_skills_to_tools: skill {skill_id} not found");
@@ -673,6 +740,7 @@ fn apply_add(
                         failed += 1;
                     } else {
                         applied += 1;
+                        synced_ok.insert((skill_id.clone(), tool_key.clone()));
                     }
                 }
                 Err(e) => {
@@ -693,29 +761,12 @@ fn apply_add(
         adapters.len(),
     );
 
-    // Mirror what sync_skill_to_tool does: also flip the scenario_skill_tools
-    // toggle so the detail panel's agent checkboxes reflect the new state.
-    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
-        let scenario_skill_ids = store
-            .get_skill_ids_for_scenario(&active_id)
-            .unwrap_or_default();
-        let all_adapter_keys: Vec<String> = tool_adapters::enabled_installed_adapters(store)
-            .iter()
-            .map(|a| a.key.clone())
-            .collect();
-        for skill_id in skill_ids {
-            if !scenario_skill_ids.contains(skill_id) {
-                continue;
-            }
-            let _ = store.ensure_scenario_skill_tool_defaults(
-                &active_id,
-                skill_id,
-                &all_adapter_keys,
-            );
-            for tool_key in adapters.keys() {
-                let _ =
-                    store.set_scenario_skill_tool_enabled(&active_id, skill_id, tool_key, true);
-            }
+    // Batch syncs are global: propagate the new on-disk state to this skill's
+    // toggle in *every* scenario it belongs to, not just the active one.
+    // Only successfully synced pairs — a failed pair keeps its old toggle.
+    for (skill_id, tool_key) in &synced_ok {
+        if let Err(e) = propagate_target_toggle(store, skill_id, tool_key, true) {
+            log::error!("apply_skills_to_tools(Add): {e}");
         }
     }
 
@@ -747,79 +798,77 @@ fn apply_remove(
         return Ok(BatchApplyResult::default());
     }
 
-    // Phase 1: drop the DB rows first so the post-delete recount below sees
-    // the new ground truth when deciding which filesystem paths to keep.
-    for (skill_id, tool, _) in &to_delete {
-        if let Err(e) = store.delete_target(skill_id, tool) {
-            log::warn!(
-                "apply_skills_to_tools(Remove): failed to delete target record for skill {skill_id} / {tool}: {e}"
-            );
-        }
-    }
-
-    // Phase 2: gather the paths the batch wanted to remove, then keep any path
-    // a remaining (skill_id, tool) row still points at. This prevents wiping a
-    // directory another adapter is sharing.
-    let candidate_paths: HashSet<PathBuf> = to_delete.iter().map(|(_, _, p)| p.clone()).collect();
-    let still_referenced: HashSet<PathBuf> = store
+    // Shared-path semantics: a target_path may be referenced by several
+    // (skill_id, tool) rows when multiple tools resolve to the same skills
+    // directory. Only physically delete a path when every row referencing it
+    // belongs to this batch; otherwise keep the files and just drop the rows.
+    let batch_pairs: HashSet<(String, String)> = to_delete
+        .iter()
+        .map(|(skill_id, tool, _)| (skill_id.clone(), tool.clone()))
+        .collect();
+    let shared_paths: HashSet<PathBuf> = store
         .get_all_targets()
         .unwrap_or_default()
         .into_iter()
+        .filter(|t| !batch_pairs.contains(&(t.skill_id.clone(), t.tool.clone())))
         .map(|t| PathBuf::from(&t.target_path))
         .collect();
 
+    // Phase 1: physical deletion first. A path that fails to delete keeps
+    // every DB row pointing at it — the pair stays visible in the UI and the
+    // user can retry — and its pairs are reported in `failed`.
+    let candidate_paths: HashSet<PathBuf> = to_delete.iter().map(|(_, _, p)| p.clone()).collect();
+    let mut failed_paths: HashSet<PathBuf> = HashSet::new();
     let mut removed = 0usize;
-    for path in candidate_paths {
-        if still_referenced.contains(&path) {
+    for path in &candidate_paths {
+        if shared_paths.contains(path) {
             log::debug!(
                 "apply_skills_to_tools(Remove): keeping {} (still referenced by another target)",
                 path.display()
             );
             continue;
         }
-        if let Err(e) = sync_engine::remove_target(&path) {
+        if let Err(e) = sync_engine::remove_target(path) {
             log::warn!(
                 "apply_skills_to_tools(Remove): failed to remove {}: {e}",
                 path.display()
             );
+            failed_paths.insert(path.clone());
         } else {
             removed += 1;
         }
     }
 
-    log::info!(
-        "apply_skills_to_tools(Remove): pairs={} fs_removed={removed}",
-        to_delete.len(),
-    );
-
-    // Mirror what unsync_skill_from_tool does: flip the scenario_skill_tools
-    // toggle to false so the detail panel reflects the removal immediately.
-    if let Ok(Some(active_id)) = store.get_active_scenario_id() {
-        let scenario_skill_ids = store
-            .get_skill_ids_for_scenario(&active_id)
-            .unwrap_or_default();
-        let all_adapter_keys: Vec<String> = tool_adapters::enabled_installed_adapters(store)
-            .iter()
-            .map(|a| a.key.clone())
-            .collect();
-        for (skill_id, tool_key, _) in &to_delete {
-            if !scenario_skill_ids.contains(skill_id) {
-                continue;
-            }
-            let _ = store.ensure_scenario_skill_tool_defaults(
-                &active_id,
-                skill_id,
-                &all_adapter_keys,
+    // Phase 2: drop DB rows and flip toggles only for pairs whose path is
+    // actually gone (or intentionally kept because another target shares it).
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for (skill_id, tool, path) in &to_delete {
+        if failed_paths.contains(path) {
+            failed += 1;
+            continue;
+        }
+        if let Err(e) = store.delete_target(skill_id, tool) {
+            log::warn!(
+                "apply_skills_to_tools(Remove): failed to delete target record for skill {skill_id} / {tool}: {e}"
             );
-            let _ =
-                store.set_scenario_skill_tool_enabled(&active_id, skill_id, tool_key, false);
+            failed += 1;
+            continue;
+        }
+        applied += 1;
+        // Batch removals are global: flip the toggle to false in *every*
+        // scenario that lists the skill, not just the active one.
+        if let Err(e) = propagate_target_toggle(store, skill_id, tool, false) {
+            log::error!("apply_skills_to_tools(Remove): {e}");
         }
     }
 
-    Ok(BatchApplyResult {
-        applied: to_delete.len(),
-        failed: 0,
-    })
+    log::info!(
+        "apply_skills_to_tools(Remove): pairs={} fs_removed={removed} failed={failed}",
+        to_delete.len(),
+    );
+
+    Ok(BatchApplyResult { applied, failed })
 }
 
 #[cfg(test)]
@@ -998,6 +1047,339 @@ mod sync_desired_targets_tests {
 
         central_repo::set_test_base_dir_override(None);
     }
+
+    /// Regression for the "UI shows enabled but not synced" bug.
+    ///
+    /// `apply_skills_to_tools` operates on the global `skill_targets` table,
+    /// so removing a `(skill, tool)` pair must flip the `scenario_skill_tools`
+    /// toggle to false in **every** scenario that lists the skill — not only
+    /// the active one. Before the fix only the active scenario was updated,
+    /// which left non-active presets' detail panels showing the tool as
+    /// enabled even though nothing was on disk anymore.
+    #[test]
+    fn batch_remove_flips_toggle_in_all_scenarios() {
+        use crate::core::skill_store::ScenarioRecord;
+        use crate::core::tool_adapters::CustomToolDef;
+
+        let _lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+        fs::create_dir_all(central_repo::skills_dir()).unwrap();
+        let store = SkillStore::new(&base.join("test.db")).unwrap();
+
+        // A single custom tool is the only eligible target.
+        let agent_dir = tmp.path().join("agent-skills");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let custom_tools = vec![CustomToolDef {
+            key: "test_agent".to_string(),
+            display_name: "Test Agent".to_string(),
+            skills_dir: agent_dir.to_string_lossy().to_string(),
+            project_relative_skills_dir: None,
+            category: Default::default(),
+        }];
+        store
+            .set_setting("custom_tools", &serde_json::to_string(&custom_tools).unwrap())
+            .unwrap();
+        let disabled_builtin: Vec<String> = tool_adapters::default_tool_adapters()
+            .into_iter()
+            .map(|a| a.key)
+            .collect();
+        store
+            .set_setting("disabled_tools", &serde_json::to_string(&disabled_builtin).unwrap())
+            .unwrap();
+
+        // Central skill source.
+        let source = central_repo::skills_dir().join("skill-x");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), "---\nname: skill-x\n---\n").unwrap();
+        store
+            .insert_skill(&SkillRecord {
+                id: "skill-x".to_string(),
+                name: "skill-x".to_string(),
+                description: None,
+                source_type: "import".to_string(),
+                source_ref: Some(source.to_string_lossy().to_string()),
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: source.to_string_lossy().to_string(),
+                content_hash: None,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+
+        // Two scenarios, both contain the skill; A is active.
+        for id in ["A", "B"] {
+            store
+                .insert_scenario(&ScenarioRecord {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    description: None,
+                    icon: None,
+                    sort_order: 0,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .unwrap();
+            store.add_skill_to_scenario(id, "skill-x").unwrap();
+        }
+        store.set_active_scenario("A").unwrap();
+
+        let enabled_tools = |sid: &str| {
+            store
+                .get_enabled_tools_for_scenario_skill(sid, "skill-x")
+                .unwrap()
+        };
+
+        // Add: syncs on disk and must enable the toggle in both scenarios.
+        apply_skills_to_tools(
+            &store,
+            &["skill-x".to_string()],
+            &["test_agent".to_string()],
+            BatchApplyMode::Add,
+        )
+        .unwrap();
+        assert!(enabled_tools("A").contains(&"test_agent".to_string()));
+        assert!(
+            enabled_tools("B").contains(&"test_agent".to_string()),
+            "Add should propagate toggle to non-active scenario too"
+        );
+
+        // Remove: the bug path. Must clear the toggle in BOTH scenarios.
+        apply_skills_to_tools(
+            &store,
+            &["skill-x".to_string()],
+            &["test_agent".to_string()],
+            BatchApplyMode::Remove,
+        )
+        .unwrap();
+        let targets = store.get_targets_for_skill("skill-x").unwrap();
+        assert!(!targets.iter().any(|t| t.tool == "test_agent"));
+        assert!(
+            !enabled_tools("A").contains(&"test_agent".to_string()),
+            "active scenario toggle should be cleared"
+        );
+        assert!(
+            !enabled_tools("B").contains(&"test_agent".to_string()),
+            "non-active scenario toggle must also be cleared (regression)"
+        );
+
+        central_repo::set_test_base_dir_override(None);
+    }
+}
+
+#[cfg(test)]
+mod apply_skills_to_tools_tests {
+    use super::*;
+    use crate::core::central_repo;
+    use crate::core::skill_store::{ScenarioRecord, SkillRecord, SkillStore};
+    use crate::core::tool_adapters::CustomToolDef;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn insert_test_skill(store: &SkillStore, id: &str) -> std::path::PathBuf {
+        let source = central_repo::skills_dir().join(id);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("SKILL.md"), format!("---\nname: {id}\n---\n")).unwrap();
+        store
+            .insert_skill(&SkillRecord {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: None,
+                source_type: "import".to_string(),
+                source_ref: Some(source.to_string_lossy().to_string()),
+                source_ref_resolved: None,
+                source_subpath: None,
+                source_branch: None,
+                source_revision: None,
+                remote_revision: None,
+                central_path: source.to_string_lossy().to_string(),
+                content_hash: None,
+                enabled: true,
+                created_at: 1,
+                updated_at: 1,
+                status: "ok".to_string(),
+                update_status: "local_only".to_string(),
+                last_checked_at: None,
+                last_check_error: None,
+            })
+            .unwrap();
+        source
+    }
+
+    fn configure_custom_tools(store: &SkillStore, tools: &[(&str, &std::path::Path)]) {
+        let custom_tools: Vec<CustomToolDef> = tools
+            .iter()
+            .map(|(key, dir)| CustomToolDef {
+                key: key.to_string(),
+                display_name: key.to_string(),
+                skills_dir: dir.to_string_lossy().to_string(),
+                project_relative_skills_dir: None,
+                category: Default::default(),
+            })
+            .collect();
+        store
+            .set_setting("custom_tools", &serde_json::to_string(&custom_tools).unwrap())
+            .unwrap();
+        let disabled_builtin: Vec<String> = tool_adapters::default_tool_adapters()
+            .into_iter()
+            .map(|a| a.key)
+            .collect();
+        store
+            .set_setting("disabled_tools", &serde_json::to_string(&disabled_builtin).unwrap())
+            .unwrap();
+    }
+
+    fn insert_scenario_with_skill(store: &SkillStore, scenario_id: &str, skill_id: &str) {
+        store
+            .insert_scenario(&ScenarioRecord {
+                id: scenario_id.to_string(),
+                name: scenario_id.to_string(),
+                description: None,
+                icon: None,
+                sort_order: 0,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store.add_skill_to_scenario(scenario_id, skill_id).unwrap();
+    }
+
+    /// Issue #10 regression: a pair whose sync fails must NOT have its
+    /// per-scenario toggle flipped to enabled. Before the fix the
+    /// end-of-batch propagation ran over `skill_ids × adapters`, so a user
+    /// who had explicitly disabled a tool saw it flip back to enabled even
+    /// though the sync to that tool just failed.
+    #[test]
+    fn apply_add_does_not_enable_toggle_for_failed_pair() {
+        let _lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+        fs::create_dir_all(central_repo::skills_dir()).unwrap();
+        let store = SkillStore::new(&base.join("test.db")).unwrap();
+
+        let ok_dir = tmp.path().join("agent-ok");
+        fs::create_dir_all(&ok_dir).unwrap();
+        // A regular file where the skills dir should be: creating the target
+        // directory beneath it fails, so every sync to this tool fails.
+        let broken_dir = tmp.path().join("agent-broken");
+        fs::write(&broken_dir, "not a directory").unwrap();
+        configure_custom_tools(
+            &store,
+            &[("ok_agent", ok_dir.as_path()), ("broken_agent", broken_dir.as_path())],
+        );
+
+        insert_test_skill(&store, "skill-y");
+        insert_scenario_with_skill(&store, "A", "skill-y");
+        store.set_active_scenario("A").unwrap();
+
+        // The user has explicitly disabled both tools for this skill in the
+        // scenario; only the successful sync may re-enable its toggle.
+        for tool in ["ok_agent", "broken_agent"] {
+            store
+                .set_scenario_skill_tool_enabled("A", "skill-y", tool, false)
+                .unwrap();
+        }
+
+        let result = apply_skills_to_tools(
+            &store,
+            &["skill-y".to_string()],
+            &["ok_agent".to_string(), "broken_agent".to_string()],
+            BatchApplyMode::Add,
+        )
+        .unwrap();
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.failed, 1);
+
+        let enabled = store
+            .get_enabled_tools_for_scenario_skill("A", "skill-y")
+            .unwrap();
+        assert!(
+            enabled.contains(&"ok_agent".to_string()),
+            "successful pair must propagate enabled=true"
+        );
+        assert!(
+            !enabled.contains(&"broken_agent".to_string()),
+            "failed pair must not be marked enabled (regression #10)"
+        );
+
+        central_repo::set_test_base_dir_override(None);
+    }
+
+    /// Issue #12/#38 regression: when the physical removal fails, the DB row
+    /// must survive (so the pair stays visible and retryable) and the failure
+    /// must be reported instead of the hardcoded `failed: 0`.
+    #[cfg(unix)]
+    #[test]
+    fn apply_remove_keeps_db_row_when_fs_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = central_repo::test_base_dir_lock();
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        central_repo::set_test_base_dir_override(Some(base.clone()));
+        fs::create_dir_all(central_repo::skills_dir()).unwrap();
+        let store = SkillStore::new(&base.join("test.db")).unwrap();
+
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        configure_custom_tools(&store, &[("test_agent", agent_dir.as_path())]);
+
+        insert_test_skill(&store, "skill-z");
+        insert_scenario_with_skill(&store, "A", "skill-z");
+        store.set_active_scenario("A").unwrap();
+
+        apply_skills_to_tools(
+            &store,
+            &["skill-z".to_string()],
+            &["test_agent".to_string()],
+            BatchApplyMode::Add,
+        )
+        .unwrap();
+        assert_eq!(store.get_targets_for_skill("skill-z").unwrap().len(), 1);
+
+        // Read-only parent: unlinking the synced target from it fails.
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = apply_skills_to_tools(
+            &store,
+            &["skill-z".to_string()],
+            &["test_agent".to_string()],
+            BatchApplyMode::Remove,
+        )
+        .unwrap();
+
+        // Restore before asserting so the tempdir can always be cleaned up.
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result.failed, 1, "fs removal failure must be counted");
+        assert_eq!(result.applied, 0);
+        let targets = store.get_targets_for_skill("skill-z").unwrap();
+        assert_eq!(
+            targets.len(),
+            1,
+            "DB row must survive a failed physical removal so the user can retry"
+        );
+        let enabled = store
+            .get_enabled_tools_for_scenario_skill("A", "skill-z")
+            .unwrap();
+        assert!(
+            enabled.contains(&"test_agent".to_string()),
+            "toggle must stay enabled while the target is still on disk"
+        );
+
+        central_repo::set_test_base_dir_override(None);
+    }
 }
 
 #[cfg(test)]
@@ -1041,4 +1423,5 @@ mod skip_check_mode_tests {
         assert!(skip_check_mode("garbage", SyncMode::Symlink).is_none());
         assert!(skip_check_mode("", SyncMode::Copy).is_none());
     }
+
 }
