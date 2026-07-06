@@ -14,6 +14,7 @@ use crate::core::{
     github_api,
     install_cancel::InstallCancelRegistry,
     installer,
+    path_guard,
     repo_lock::RepoLock,
     scanner,
     skill_metadata::{self, is_valid_skill_dir},
@@ -1993,6 +1994,16 @@ pub fn resolve_skill_dir(
 ) -> Result<PathBuf, AppError> {
     if let Some(subpath) = subpath {
         let path = repo_dir.join(subpath);
+        // `subpath` is derived from a user-pasted git URL (e.g. the `.../tree/
+        // main/<subpath>` segment) and may contain `..` or absolute components.
+        // Reject anything that resolves outside the cloned repo before touching
+        // it, so a crafted URL can't turn an arbitrary local directory (e.g.
+        // `~/.ssh`) into a "skill" that gets copied into the central repo.
+        if !path_guard::is_path_safe(repo_dir, &path) {
+            return Err(AppError::invalid_input(
+                "Skill subpath escapes the repository",
+            ));
+        }
         if path.exists() && path.is_dir() {
             return Ok(path);
         }

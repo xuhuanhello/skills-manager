@@ -158,7 +158,9 @@ pub fn download_skill_dir(
     let client = build_http_client(proxy_url, 30);
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_path = temp_dir.path().to_path_buf();
-    temp_dir.keep();
+    // Persist the temp dir (caller owns cleanup); the returned path equals
+    // `temp_path` already captured above, so the result is intentionally unused.
+    let _ = temp_dir.keep();
 
     download_directory_recursive(&client, owner, repo, branch, skill_path, &temp_path)?;
 
@@ -208,6 +210,18 @@ fn download_directory_recursive(
     fs::create_dir_all(local_dir)?;
 
     for item in items {
+        // `item.name` is attacker-controlled (a remote repo can name a tree
+        // entry anything, including `C:\..\evil` or an absolute path). Only a
+        // single, containment-checked path component is ever accepted; anything
+        // else is a traversal attempt and is skipped rather than joined.
+        let Some(entry_path) = super::path_guard::safe_join(local_dir, &item.name) else {
+            log::warn!(
+                "Skipping repo entry with unsafe name '{}' under '{}'",
+                item.name,
+                dir_path
+            );
+            continue;
+        };
         match item.item_type.as_str() {
             "file" => {
                 if let Some(download_url) = &item.download_url {
@@ -218,15 +232,16 @@ fn download_directory_recursive(
 
                     if file_resp.status().is_success() {
                         let bytes = file_resp.bytes()?;
-                        let file_path = local_dir.join(&item.name);
-                        fs::write(&file_path, &bytes)
-                            .with_context(|| format!("Failed to write '{}'", file_path.display()))?;
+                        fs::write(&entry_path, &bytes).with_context(|| {
+                            format!("Failed to write '{}'", entry_path.display())
+                        })?;
                     }
                 }
             }
             "dir" => {
-                let sub_dir = local_dir.join(&item.name);
-                download_directory_recursive(client, owner, repo, branch, &item.path, &sub_dir)?;
+                download_directory_recursive(
+                    client, owner, repo, branch, &item.path, &entry_path,
+                )?;
             }
             _ => {}
         }

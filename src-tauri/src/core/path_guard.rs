@@ -73,6 +73,45 @@ pub fn sanitize_name(input: &str) -> String {
     }
 }
 
+/// Join an untrusted **single-segment** `name` onto `base`, returning `None`
+/// when the result would escape `base` or `name` is not a plain file name.
+///
+/// Use this for entry names that must be exactly one path component — e.g. a
+/// file or directory name coming from a remote API response, where interior
+/// separators, `..`, absolute paths, or Windows drive prefixes are all signs
+/// of an attempted traversal rather than a legitimate name. Multi-segment
+/// relative paths (where interior separators are expected, such as a
+/// `skills/foo` subpath) must be validated with [`is_path_safe`] instead.
+///
+/// The check is defence-in-depth: an explicit separator reject (covers both
+/// `/` and `\` regardless of build target), a single-`Normal`-component
+/// requirement, and a final [`is_path_safe`] containment check.
+pub fn safe_join(base: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    // Reject any separator explicitly so a `\`-containing name is refused even
+    // on Unix builds (where the std path parser would treat it as one Normal
+    // component and miss the Windows traversal it enables).
+    if name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    // Require exactly one Normal component. A Windows drive/prefix (`C:`), root,
+    // or any `.`/`..` component fails this and is rejected.
+    let mut components = Path::new(name).components();
+    let single = match (components.next(), components.next()) {
+        (Some(Component::Normal(c)), None) => c,
+        _ => return None,
+    };
+
+    let joined = base.join(single);
+    if is_path_safe(base, &joined) {
+        Some(joined)
+    } else {
+        None
+    }
+}
+
 /// Verify that `target` resolves to a location inside `base`.
 ///
 /// Both paths are canonicalized when possible so symlinks and `..` segments
@@ -238,5 +277,40 @@ mod tests {
     fn path_safe_accepts_base_itself() {
         let tmp = tempdir().unwrap();
         assert!(is_path_safe(tmp.path(), tmp.path()));
+    }
+
+    #[test]
+    fn safe_join_accepts_plain_name() {
+        // Use a real, canonicalizable base: the production callers always join
+        // onto an existing directory. (A non-existent base on macOS would hit
+        // the /tmp -> /private/tmp symlink asymmetry, which is a test artifact,
+        // not a safe_join behavior.)
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        assert_eq!(safe_join(base, "skill.md"), Some(base.join("skill.md")));
+        assert_eq!(safe_join(base, "技能"), Some(base.join("技能")));
+    }
+
+    #[test]
+    fn safe_join_rejects_separators() {
+        let base = Path::new("/tmp/base");
+        // Forward slash (sub-path) and back-slash (Windows traversal) both refused.
+        assert_eq!(safe_join(base, "a/b"), None);
+        assert_eq!(safe_join(base, "..\\..\\etc"), None);
+        assert_eq!(safe_join(base, "C:\\Users\\Public\\evil.bat"), None);
+    }
+
+    #[test]
+    fn safe_join_rejects_traversal_and_dots() {
+        let base = Path::new("/tmp/base");
+        assert_eq!(safe_join(base, ".."), None);
+        assert_eq!(safe_join(base, "."), None);
+        assert_eq!(safe_join(base, ""), None);
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute() {
+        let base = Path::new("/tmp/base");
+        assert_eq!(safe_join(base, "/etc/passwd"), None);
     }
 }

@@ -55,7 +55,11 @@ impl AuditDraft {
 
     pub fn fail(mut self, error: impl Into<String>) -> Self {
         self.success = false;
-        self.detail = Some(error.into());
+        // Error details often embed the failing git remote URL, which may carry
+        // an inline `user:token@` credential. Sanitize here — the single sink
+        // for every audit detail — so nothing secret is ever persisted to the
+        // `audit_log` table (which, unlike `settings`, is not encrypted at rest).
+        self.detail = Some(crate::core::log_sanitize::sanitize(&error.into()));
         self
     }
 
@@ -71,7 +75,31 @@ impl AuditDraft {
     }
 
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
-        self.detail = Some(detail.into());
+        // Same rationale as `fail`: scrub any credential-bearing text before it
+        // reaches the unencrypted audit_log table.
+        self.detail = Some(crate::core::log_sanitize::sanitize(&detail.into()));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fail_redacts_inline_git_credentials() {
+        let draft = AuditDraft::new("install")
+            .fail("clone failed: https://alice:ghp_secretsecretsecret@github.com/foo/bar.git");
+        let detail = draft.detail.expect("detail set");
+        assert!(!detail.contains("ghp_secretsecretsecret"), "token leaked: {detail}");
+        assert!(detail.contains("<redacted>"));
+        // Host is preserved so the log is still diagnostically useful.
+        assert!(detail.contains("github.com/foo/bar.git"));
+    }
+
+    #[test]
+    fn detail_redacts_credentials_too() {
+        let draft = AuditDraft::new("sync").detail("remote https://u:tok@host/x.git");
+        assert!(!draft.detail.unwrap().contains("tok@"));
     }
 }
